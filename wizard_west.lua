@@ -43,6 +43,7 @@ local cfg = {
 	bossFarm = false,       -- bandit mission farm (combat)
 	autoMine = false,       -- mine ore veins (needs Vocare Pickaxe)
 	autoContracts = true,
+	autoHop = true,         -- hostile server (many flees/deaths, low income) -> ask the watchdog to rejoin elsewhere
 	-- safety
 	avoidPlayers = true,    -- flee from dangerous players
 	dangerRadius = 220,     -- a dangerous player this close (and closing in / attacking / <160) -> leave
@@ -942,13 +943,22 @@ function W.openPrompt(p)
 	-- the prompt needs line of sight: stand on the ground beside the loot, try each side
 	local sides = { cf.RightVector * (size.X / 2 + 3), -cf.RightVector * (size.X / 2 + 3), cf.LookVector * (size.Z / 2 + 3), -cf.LookVector * (size.Z / 2 + 3) }
 	local first = true
-	for _, off in ipairs(sides) do
+	local tStart, tArrive = os.clock(), nil
+	local r0 = hrp()
+	local dist0 = r0 and (r0.Position - cf.Position).Magnitude or 0
+	local function note(res, side)
+		W.openLog = W.openLog or {}
+		table.insert(W.openLog, 1, string.format("%s %dm travel %.1fs side%d hold%.1f total %.1fs %s", lootName(p), dist0, (tArrive or os.clock()) - tStart, side, p.HoldDuration, os.clock() - tStart, res))
+		if #W.openLog > 30 then table.remove(W.openLog) end
+	end
+	for si, off in ipairs(sides) do
 		local spot = cf.Position + off
 		local gy = groundY(spot.X, spot.Z)
 		if not gy or gy > cf.Position.Y + 6 then gy = cf.Position.Y - size.Y / 2 end -- under a roof: use the loot's floor
 		local stand = Vector3.new(spot.X, gy + 3, spot.Z)
 		if first then
-			if roofed(stand) then
+			-- no streaming here (~2s per chest); a roof we can't see yet is caught by the fly abort
+			if roofed(stand, true) then
 				if not W.walkIn(stand) then t.n = math.max(t.n, 2) W.hoverPos = nil return false end
 			else
 				W.travel(stand, 0, true)
@@ -957,7 +967,8 @@ function W.openPrompt(p)
 		else
 			W.glide(stand, 30)
 		end
-		if not p.Parent then return false end
+		tArrive = tArrive or os.clock()
+		if not p.Parent then note("gone", si) return false end
 		if W.flyBlocked then -- roof over the loot: skip it for a while
 			t.n = math.max(t.n, 2)
 			W.hoverPos = nil
@@ -973,12 +984,14 @@ function W.openPrompt(p)
 		local t0 = os.clock()
 		repeat task.wait(0.2) until openedByMe(p) or not p.Parent or os.clock() - t0 > 1.2 + p.HoldDuration
 		if openedByMe(p) or not p.Parent then
+			note("ok", si)
 			W.hoverPos = nil
 			W.lastOpened, W.lastOpenT = lootName(p), os.clock()
 			W.stats.opened = (W.stats.opened or 0) + 1
 			return true
 		end
 	end
+	note("failed", 4)
 	W.hoverPos = nil
 	return false
 end
@@ -1435,10 +1448,46 @@ end
 -- heartbeat for the PC-side watchdog (ww_watchdog.sh): time + "disconnected" flag. A kicked /
 -- disconnected client (error 277) looks alive to the bridge but nothing replicates any more.
 local GuiService = game:GetService("GuiService")
+-- Server hop: a hostile server (hunters everywhere) runs at 40-55k/h vs 100-200k/h on a calm one.
+-- A rejoin (process restart by the watchdog) lands on another server and also wipes bounty/rogue.
+-- HOP when the last 10 min had >= 8 flees or 2 deaths and made < 70k/h; at most every 25 min,
+-- never while holding the Baron (Royal Apparate is worth more than a calm server).
+W.loadedAt = os.clock()
+W.fleeTimes, W.deathTimes, W.moneyHist = {}, {}, {}
+cfg.autoHop = cfg.autoHop ~= false
+local function countSince(list, sec)
+	local n = 0
+	for _, t in ipairs(list) do if os.clock() - t < sec then n += 1 end end
+	return n
+end
+function W.hopWanted()
+	if not cfg.autoHop or lp:GetAttribute("Noble") == "Baron" then return false end
+	if os.clock() - W.loadedAt < 600 then return false end
+	local last = 0
+	pcall(function() last = tonumber(readfile("ww_hop.txt")) or 0 end)
+	if os.time() - last < 1500 then return false end
+	local old = W.moneyHist[1]
+	if not old or os.clock() - old.t < 590 then return false end
+	local perHour = (money() - old.m) / (os.clock() - old.t) * 3600
+	local flees, deaths = countSince(W.fleeTimes, 600), countSince(W.deathTimes, 1200)
+	if (flees >= 8 or deaths >= 2) and perHour < 70000 then
+		W.hopReason = string.format("%d flees, %d deaths, %.0fk/h", flees, deaths, perHour / 1000)
+		return true
+	end
+	return false
+end
 spawnLoop("heartbeat", function()
 	local dc = false
 	pcall(function() dc = GuiService:GetErrorMessage() ~= "" end)
-	pcall(writefile, "ww_hb.txt", string.format("%d %s %d %s", os.time(), dc and "DC" or "OK", money(), tostring(W.status)))
+	table.insert(W.moneyHist, { t = os.clock(), m = money() })
+	while W.moneyHist[1] and os.clock() - W.moneyHist[1].t > 600 do table.remove(W.moneyHist, 1) end
+	local flag = dc and "DC" or "OK"
+	if not dc and W.hopWanted() then
+		flag = "HOP"
+		pcall(writefile, "ww_hop.txt", tostring(os.time()))
+		logf("ww_deaths.txt", string.format("[%s] server hop requested: %s\n", os.date("%H:%M:%S"), tostring(W.hopReason)))
+	end
+	pcall(writefile, "ww_hb.txt", string.format("%d %s %d %s", os.time(), flag, money(), tostring(W.status)))
 	task.wait(5)
 end)
 
@@ -1552,7 +1601,10 @@ function W.attackerTarget()
 	local best, bd
 	for pl, untilT in pairs(W.attackers) do
 		local m = pl.Character
-		if os.clock() < untilT and m and m.PrimaryPart and r then
+		-- only legal targets: hitting a player who isn't rogue / wanted makes US rogue (+50 bounty,
+		-- seen right after our bounty cleared while we still shot at the hunter who'd chased us)
+		local legal = pl:GetAttribute("Rogue") or (m and m:GetAttribute("Rogued")) or (pl:GetAttribute("Bounty") or 0) > 0
+		if os.clock() < untilT and legal and m and m.PrimaryPart and r then
 			local d = (m.PrimaryPart.Position - r.Position).Magnitude
 			if d < cfg.aimRange and (not bd or d < bd) then best, bd = m, d end
 		end
@@ -1699,6 +1751,7 @@ function W.flee(reason)
 	W.fleeing = true
 	W.hoverPos = nil
 	W.stats.flees = (W.stats.flees or 0) + 1
+	table.insert(W.fleeTimes, os.clock())
 	local r, h = hrp(), hum()
 	if not (r and h) then W.fleeing = false return end
 	local th = W.realThreats()
@@ -1772,7 +1825,9 @@ local function artifactOk(site)
 	if cfg.heistNeedApparate and not apparateReady() then return false, "apparate on cooldown" end
 	return true
 end
-function W.heist()
+-- chestsOnly=false: only go when the artifact can be taken too (bank chests alone ~ break even:
+-- ~1100 loot vs 40s of rogue status); the farm loop calls it with true as a fallback when idle
+function W.heist(chestsOnly)
 	if os.clock() < (W.heistCooldown or 0) then return false end
 	local targets = {}
 	for _, p in ipairs(W.artifactTargets()) do
@@ -1784,6 +1839,8 @@ function W.heist()
 		end
 	end
 	if #targets == 0 then return false end
+	local withArtifact = isArtifactPrompt(targets[#targets])
+	if not withArtifact and not chestsOnly then return false end
 	local site = mdlPos(targets[1].Parent)
 	if not site then return false end
 	-- scout with the radar (map-wide): a rogue camping the loot kills looters on arrival
@@ -1894,6 +1951,7 @@ local function hookDeath(c)
 	conn(h.Died, function()
 		if logged then return end -- Died fires more than once here
 		logged = true
+		table.insert(W.deathTimes, os.clock())
 		local thf = {}
 		for k, v in pairs(c:GetAttributes()) do
 			if k:sub(1, 4) == "THF_" then thf[#thf + 1] = k:sub(5) .. "@" .. string.format("%.1f", v) end
@@ -2079,6 +2137,8 @@ W.farmFn = function()
 			return
 		end
 	end
+	-- nothing better to do: bank chests even without the artifact
+	if (cfg.bankChests or cfg.artifactFarm) and W.heist(true) then return end
 	if cfg.autoMine then W.mineOnce() return end
 	status("idle")
 end
