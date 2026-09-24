@@ -30,7 +30,8 @@ local cfg = {
 	vacuum = true,          -- collect every money/scroll drop on the map
 	autoSell = true,        -- walk to a trinket seller when the bag is worth enough
 	sellAt = 1,             -- sell when bag holds >= this many trinkets
-	artifactFarm = false,   -- bank heist: artifact-mission chests + artifact (gives bounty!)
+	bankChests = true,      -- bank chests at artifact missions (trinkets, +200 bounty each -> auto cleared)
+	artifactFarm = false,   -- also steal the artifact (+1000 bounty, Diamond after 30s held)
 	heistClear = 150,       -- skip the heist while a rogue is this close to the loot
 	heistNeedApparate = true, -- only grab the artifact when Apparate is ready for the escape
 	wagonLoot = true,       -- open unlocked wagon loot while farming
@@ -505,6 +506,18 @@ local function trinkets()
 	return n, v
 end
 W.trinkets = trinkets
+-- loot shows up several seconds after a chest/wagon opens (spin animation), so log arrivals
+W.loot = {}
+local function onLoot(t)
+	if t:IsA("Tool") and t:GetAttribute("SellValue") then
+		local e = string.format("%s $%d (%s, %.0fs after open)", t.Name, t:GetAttribute("SellValue"), tostring(W.lastOpened or "?"), os.clock() - (W.lastOpenT or 0))
+		table.insert(W.loot, 1, e)
+		if #W.loot > 20 then table.remove(W.loot) end
+		W.stats.lootValue = (W.stats.lootValue or 0) + t:GetAttribute("SellValue")
+	end
+end
+conn(lp.Backpack.ChildAdded, onLoot)
+conn(lp.ChildAdded, function(b) if b:IsA("Backpack") then conn(b.ChildAdded, onLoot) end end) -- new Backpack each respawn
 
 -- Selling = TrinketSellEvent:FireServer(<DialogConfig>). The game's client fires it once when you
 -- step into the zone (and never again until you leave, hence "needs several tries").
@@ -632,7 +645,12 @@ function W.openPrompt(p)
 		fireproximityprompt(p)
 		local t0 = os.clock()
 		repeat task.wait(0.2) until openedByMe(p) or not p.Parent or os.clock() - t0 > 1.2 + p.HoldDuration
-		if openedByMe(p) or not p.Parent then W.hoverPos = nil return true end
+		if openedByMe(p) or not p.Parent then
+			W.hoverPos = nil
+			W.lastOpened, W.lastOpenT = (p.ObjectText ~= "" and p.ObjectText or holder.Name), os.clock()
+			W.stats.opened = (W.stats.opened or 0) + 1
+			return true
+		end
 	end
 	W.hoverPos = nil
 	return false
@@ -644,13 +662,13 @@ function W.artifactTargets()
 	return prompts(function(p)
 		if p.Name ~= "LootGiver" then return false end
 		local am = p:FindFirstAncestor("ArtifactMission")
+		if am and p.Parent and p.Parent.Name == "Artifact" and not cfg.artifactFarm then return false end
 		return am ~= nil and promptFree(p)
 	end)
 end
 function W.wagonTargets()
 	return prompts(function(p)
 		if (p:GetAttribute("BountyGiver") or 0) > 0 and not cfg.artifactFarm then return false end -- would make us wanted
-		if p.ObjectText == "Animal" then return false end -- "Rescue Animal": measured, gives nothing
 		return p.Name == "LootGiver" and p:FindFirstAncestor("ArtifactMission") == nil and promptFree(p)
 	end)
 end
@@ -967,8 +985,11 @@ function W.missionTarget()
 	local best, bd
 	for _, m in ipairs(workspace.Missions:GetChildren()) do
 		if m:IsA("Model") and not m:GetAttribute("Completed") and (m:GetAttribute("EnemiesLeft") or 0) > 0 then
-			local d = (m:GetPivot().Position - r.Position).Magnitude
-			if not bd or d < bd then best, bd = m, d end
+			-- clearing a camp unlocks its 2 rescue wagons: prefer the one that's done soonest
+			-- (flight ~120 studs/s, ~4s per bandit), skip camps with hostile players around
+			local mp = m:GetPivot().Position
+			local d = (mp - r.Position).Magnitude / 120 + m:GetAttribute("EnemiesLeft") * 4
+			if #W.threats(200, mp) == 0 and (not bd or d < bd) then best, bd = m, d end
 		end
 	end
 	return best
@@ -1107,7 +1128,7 @@ spawnLoop("safety", function()
 	if cfg.avoidPlayers and #(W.heistActive and W.threats(45) or W.realThreats()) > 0 then W.dangerUntil = math.max(W.dangerUntil, os.clock() + 8) end
 	local lowHp = h.Health / h.MaxHealth * 100 < cfg.fleeHp
 	local danger = cfg.avoidPlayers and (os.clock() < W.dangerUntil or lowHp)
-	if danger and not W.fleeing and (cfg.bossFarm or cfg.artifactFarm or cfg.autoMine) then
+	if danger and not W.fleeing and (cfg.bossFarm or cfg.artifactFarm or cfg.bankChests or cfg.autoMine) then
 		W.stop() -- abort whatever we are doing; farm loop picks up the flee
 	end
 end)
@@ -1288,7 +1309,7 @@ spawnLoop("farm", function()
 	if cfg.autoBuy then W.autoBuyStep() end
 	if cfg.autoEquipSpells and os.clock() - (W.lastEquip or 0) > 15 then W.lastEquip = os.clock() W.autoEquipSpells() end
 
-	local farmingAny = cfg.artifactFarm or cfg.bossFarm or cfg.autoMine
+	local farmingAny = cfg.artifactFarm or cfg.bankChests or cfg.bossFarm or cfg.autoMine
 	if farmingAny and cfg.avoidPlayers then
 		local h = hum()
 		if os.clock() < W.dangerUntil then W.flee("hostile player") return end
@@ -1296,6 +1317,7 @@ spawnLoop("farm", function()
 	end
 	if lp.Backpack:FindFirstChild("Artifact") or (char() and char():FindFirstChild("Artifact")) then waitArtifact() return end
 	-- wanted: sell loot if the seller is clear, otherwise hide until the bounty clears
+	if (cfg.bankChests or cfg.artifactFarm) and W.heist() then return end
 	if W.iAmWanted() then W.clearBounty() end
 	if W.iAmWanted() and (farmingAny) and cfg.layLow then
 		-- sell right away unless the bounty clears soon anyway (then every seller incl. police is fine)
@@ -1318,10 +1340,17 @@ spawnLoop("farm", function()
 	if cfg.autoSell and trinkets() >= cfg.sellAt and farmingAny and not W.findTarget(260) then
 		W.sellTrinkets() return
 	end
-	if cfg.artifactFarm and W.heist() then return end
-	if cfg.wagonLoot and (cfg.artifactFarm or cfg.bossFarm) then
-		local t = W.wagonTargets()
-		if #t > 0 then status("wagon loot") W.openPrompt(t[1]) return end
+	if cfg.wagonLoot and farmingAny then
+		local r = hrp()
+		local best, bd
+		for _, p in ipairs(W.wagonTargets()) do
+			local pp = mdlPos(p.Parent)
+			if pp and #W.threats(150, pp) == 0 then
+				local d = (pp - r.Position).Magnitude
+				if not bd or d < bd then best, bd = p, d end
+			end
+		end
+		if best then status(string.format("rescue wagon (%dm)", bd)) W.openPrompt(best) return end
 	end
 	if cfg.bossFarm then
 		local m = W.missionTarget()
@@ -1605,9 +1634,10 @@ header(pF, "money")
 toggle(pF, "Vacuum all money/scroll drops (map-wide)", "vacuum", applyVacuum)
 toggle(pF, "Auto sell trinkets", "autoSell")
 number(pF, "Sell when trinkets >=", "sellAt", 1, 1, 50)
-toggle(pF, "Bank heist (chests + artifact, gives BOUNTY)", "artifactFarm")
+toggle(pF, "Bank chests (+200 bounty each, auto-cleared)", "bankChests")
+toggle(pF, "Also steal the artifact (+1000 bounty)", "artifactFarm")
 button(pF, "Run one heist now", function() local a = cfg.avoidPlayers W.heist() end)
-toggle(pF, "Open unlocked wagon loot", "wagonLoot")
+toggle(pF, "Open rescue wagons (trinkets ~$1-1.5k)", "wagonLoot")
 toggle(pF, "Bandit mission farm (combat)", "bossFarm", function(v) if not v then W.farming = false W.hoverPos = nil end end)
 number(pF, "Fight distance from bandit", "fightDistance", 1, 8, 120)
 toggle(pF, "Auto mine ore (needs Vocare Pickaxe)", "autoMine")
