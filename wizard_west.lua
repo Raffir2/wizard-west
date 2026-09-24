@@ -51,13 +51,12 @@ local cfg = {
 	-- travel
 	travelSpeed = 55,       -- no-broom safe speed (server rolls back above ~65)
 	broomTravel = true,     -- ride broom while travelling -> higher allowed speed
-	broomSpeed = 70,        -- broom max is 72; faster gets rubberbanded near ground
+	broomSpeed = 120,       -- smooth flight on the broom: 140 measured clean, 160 knocks you off
 	underground = false,    -- experimental: travel below the terrain (glitchy, broom can't run there)
 	flyHeight = 22,         -- broom cruise height above ground/roofs
 	undergroundDepth = 14,
 	fightDistance = 24,     -- bandit farm: stand on the ground this far from the target
-	blinkTravel = true,     -- dash-blink 120 studs during travel (server accepts it after DashEvent)
-	blinkReserve = 33,
+	blinkTravel = true,     -- start trips with a burst of 95-stud dash-blinks (~230 studs/s)
 	dismountOnArrive = true, -- get off the broom on arrival so dash stamina refills      -- keep this much dash stamina for emergencies
 	useApparate = true,     -- use Apparate spell for trips > apparateMin studs
 	apparateMin = 900,
@@ -182,29 +181,59 @@ function W.broomOn()
 	return false
 end
 
--- DashForward is a 128-stud blink done client side; after DashEvent the server accepts the jump
-function W.canBlink(reserve)
+-- Blink bursts. After DashEvent("DashForward") the server accepts one ~100 stud jump even when
+-- the dash itself is refused (no stamina / on cooldown) - no event = rolled back.
+-- Measured: 6-10 jumps of 95-100 studs every ~0.4s pass after a rest (~230 studs/s); keep going
+-- and it starts rolling jumps back (sustained ~60/s, no better than the broom). 120+ always fails.
+local BLINK_STEP, BLINK_GAP, BURST_MAX, BURST_REFILL = 95, 0.32, 7, 1.8
+function W.canBlink()
 	local c = char()
 	if not c then return false end
-	if (c:GetAttribute("DashStamina") or 0) < 33 + (reserve or 0) then return false end
-	if workspace:GetServerTimeNow() <= (c:GetAttribute("DashCD") or 0) then return false end
 	if c:GetAttribute("CastingSpell") or c:GetAttribute("Ragdolled") or lp:GetAttribute("Jailed") then return false end
-	return os.clock() - (W.lastBlink or 0) > 0.9
+	return c.PrimaryPart ~= nil and not c.PrimaryPart.Anchored
+end
+-- jumps available right now (the budget refills while we don't blink)
+function W.burstBudget()
+	return math.clamp(math.floor((os.clock() - (W.lastBurst or 0)) / BURST_REFILL), 0, BURST_MAX)
 end
 function W.blinkTo(pos)
 	local r = hrp()
-	if not r or not W.canBlink(0) then return false end
+	if not r or not W.canBlink() then return false end
 	local d = pos - r.Position
-	if d.Magnitude > 120 then pos = r.Position + d.Unit * 120 end
-	W.lastBlink = os.clock()
+	if d.Magnitude > BLINK_STEP then pos = r.Position + d.Unit * BLINK_STEP end
 	Events.DashEvent:FireServer("DashForward", false)
 	task.wait(0.08)
 	r = hrp()
 	if not r then return false end
 	r.AssemblyLinearVelocity = Vector3.zero
-	r.CFrame = CFrame.new(pos) * (r.CFrame - r.CFrame.Position)
+	local flat = Vector3.new(d.X, 0, d.Z)
+	r.CFrame = flat.Magnitude > 0.1 and CFrame.new(pos, pos + flat) or CFrame.new(pos) * (r.CFrame - r.CFrame.Position)
 	W.stats.blinks = (W.stats.blinks or 0) + 1
+	W.lastBurst = os.clock()
 	return true
+end
+-- hop toward goal (ground level) until the budget is used, we're close, or the server pulls one back
+function W.blinkBurst(goal, maxN, token)
+	local n = 0
+	local budget = math.min(maxN or BURST_MAX, W.burstBudget())
+	local last = hrp() and hrp().Position
+	while n < budget and last do
+		if token and token ~= W.travelToken then break end
+		local r = hrp()
+		if not r or not W.canBlink() then break end
+		-- a server rollback throws us ~a whole step back; landing/sliding only moves a few studs
+		if (Vector3.new(r.Position.X - last.X, 0, r.Position.Z - last.Z)).Magnitude > 40 then W.stats.blinkRB = (W.stats.blinkRB or 0) + 1 break end
+		local flat = Vector3.new(goal.X - r.Position.X, 0, goal.Z - r.Position.Z)
+		if flat.Magnitude < 80 then break end
+		local to = r.Position + flat.Unit * BLINK_STEP
+		local gy = groundY(to.X, to.Z)
+		to = Vector3.new(to.X, (gy and gy + 4) or r.Position.Y, to.Z)
+		if not W.blinkTo(to) then break end
+		last = to
+		n += 1
+		task.wait(BLINK_GAP)
+	end
+	return n
 end
 
 -- straight CFrame glide with server-rollback detection (speed backs off automatically)
@@ -232,8 +261,8 @@ function W.glide(goal, speed, token)
 				W.lastBroomTry = os.clock()
 				task.spawn(W.broomOn)
 			end
-		elseif cfg.broomTravel and speed < cfg.broomSpeed and os.clock() >= (W.slowUntil or 0) then
-			speed = math.min(cfg.broomSpeed, speed + 40 * dt) -- ramp back up once flying again
+		elseif cfg.broomTravel and speed < math.min(cfg.broomSpeed, 70) and os.clock() >= (W.slowUntil or 0) then
+			speed = math.min(cfg.broomSpeed, 70, speed + 40 * dt) -- short hops near the ground stay <= 70
 		end
 		if (rr.Position - lastSet).Magnitude > 35 then -- server pulled us back
 			rollbacks += 1
@@ -251,6 +280,92 @@ function W.glide(goal, speed, token)
 		local flat = Vector3.new(d.X, 0, d.Z)
 		rr.CFrame = flat.Magnitude > 0.1 and CFrame.new(cur, cur + flat) or CFrame.new(cur) * (rr.CFrame - rr.CFrame.Position)
 		lastSet = cur
+	end)
+	repeat task.wait() until done
+	W.travelling = false
+	return ok, speed
+end
+
+-- smooth flight: one continuous controller for the whole leg. Horizontal speed stays constant;
+-- height follows the highest ground in a look-ahead window (climb early, no bobbing per waypoint).
+function W.fly(goal, speed, token, opts)
+	opts = opts or {}
+	local r = hrp()
+	if not r then return false end
+	token = token or W.travelToken
+	local look = opts.look or 160
+	local vUp, vDown = opts.vUp or 45, opts.vDown or 30
+	local clear = opts.clear or cfg.flyHeight
+	W.travelling = true
+	W.flySpeed = nil
+	local cur = r.Position
+	local startDist = Vector3.new(goal.X - cur.X, 0, goal.Z - cur.Z).Magnitude
+	local maxT = startDist / 35 + 10
+	local t0 = os.clock()
+	local lastSet = cur
+	local rollbacks = 0
+	local prof, profT = nil, 0
+	local done, ok = false, true
+	local c
+	-- highest ground between here and `look` studs ahead (sampled every 12 studs, cached 0.25s)
+	local function cruiseY(pos, dir, remain)
+		if os.clock() - profT < 0.25 and prof then return prof end
+		profT = os.clock()
+		local top = -math.huge
+		for d = 0, math.min(look, remain), 12 do
+			local p = pos + dir * d
+			local gy = groundY(p.X, p.Z)
+			if gy and gy > top then top = gy end
+		end
+		prof = top > -math.huge and top + clear or nil
+		return prof
+	end
+	c = RS.Heartbeat:Connect(function(dt)
+		local rr = hrp()
+		if not rr or token ~= W.travelToken or os.clock() - t0 > maxT then ok = false done = true c:Disconnect() return end
+		local jet = char() and char():GetAttribute("JetPacking")
+		local sp = speed
+		if not jet then
+			sp = math.min(sp, cfg.travelSpeed)
+			if W.inTrip and cfg.broomTravel and (W.tripBroomTries or 0) < 3 and os.clock() - (W.lastBroomTry or 0) > 3 then
+				W.tripBroomTries = (W.tripBroomTries or 0) + 1
+				W.lastBroomTry = os.clock()
+				task.spawn(W.broomOn)
+			end
+		elseif cfg.broomTravel and rollbacks == 0 then
+			sp = math.max(sp, cfg.broomSpeed)
+		end
+		if os.clock() < (W.slowUntil or 0) then sp = math.min(sp, jet and 70 or 45) end
+		-- ramp up instead of jumping straight to full speed
+		W.flySpeed = math.min(sp, (W.flySpeed or cfg.travelSpeed) + 80 * dt)
+		sp = W.flySpeed
+		if (rr.Position - lastSet).Magnitude > 35 then -- server pulled us back
+			rollbacks += 1
+			W.stats.rollbacks = (W.stats.rollbacks or 0) + 1
+			cur = rr.Position
+			speed = math.max(40, speed * 0.8)
+			if rollbacks >= 2 then W.slowUntil = os.clock() + 30 end
+		end
+		local lv = rr:FindFirstChildOfClass("LinearVelocity")
+		if lv then lv.MaxForce = 0 end
+		local flat = Vector3.new(goal.X - cur.X, 0, goal.Z - cur.Z)
+		local remain = flat.Magnitude
+		local dir = remain > 0.01 and flat.Unit or Vector3.zero
+		-- horizontal step
+		local step = math.min(sp * dt, remain)
+		local nx, nz = cur.X + dir.X * step, cur.Z + dir.Z * step
+		-- vertical: cruise height ahead, but descend onto the goal over the last stretch
+		local want = cruiseY(Vector3.new(nx, 0, nz), dir, remain) or cur.Y
+		local finalApproach = opts.descend ~= false and remain < math.max(60, (cur.Y - goal.Y) * 1.6)
+		if finalApproach then want = goal.Y end
+		local dy = want - cur.Y
+		local vmax = (dy > 0 and vUp or (finalApproach and 60 or vDown)) * dt
+		local ny = cur.Y + math.clamp(dy, -vmax, vmax)
+		cur = Vector3.new(nx, ny, nz)
+		rr.AssemblyLinearVelocity = Vector3.zero
+		rr.CFrame = remain > 0.5 and CFrame.new(cur, cur + dir) or CFrame.new(cur) * (rr.CFrame - rr.CFrame.Position)
+		lastSet = cur
+		if remain <= step + 0.01 and math.abs(goal.Y - cur.Y) < 1.5 then done = true c:Disconnect() end
 	end)
 	repeat task.wait() until done
 	W.travelling = false
@@ -309,60 +424,23 @@ function W._travel(goal, above, exact)
 		r = hrp()
 		dist = (target - r.Position).Magnitude
 	end
-	-- broom flight drains dash stamina, so spend spare stamina on blinks first
-	if cfg.blinkTravel and not (char() and char():GetAttribute("JetPacking")) then
-		while dist > 200 and W.canBlink(cfg.blinkReserve) and token == W.travelToken do
-			local rr = hrp()
-			local dir = Vector3.new(target.X - rr.Position.X, 0, target.Z - rr.Position.Z)
-			local to = rr.Position + dir.Unit * 120
-			local gy = groundY(to.X, to.Z)
-			if not W.blinkTo(Vector3.new(to.X, (gy and gy + 4) or rr.Position.Y, to.Z)) then break end
-			local tw = os.clock()
-			repeat task.wait(0.1) until W.canBlink(cfg.blinkReserve) or os.clock() - tw > 1.6
-			rr = hrp()
-			dist = (Vector3.new(target.X, 0, target.Z) - Vector3.new(rr.Position.X, 0, rr.Position.Z)).Magnitude
-		end
+	-- a blink burst covers the first ~600 studs in ~3s, the broom does the rest
+	if cfg.blinkTravel and dist > 200 and not (char() and char():GetAttribute("JetPacking")) then
+		W.blinkBurst(target, nil, token)
+		if token ~= W.travelToken then return false end
+		r = hrp()
+		dist = (Vector3.new(target.X, 0, target.Z) - Vector3.new(r.Position.X, 0, r.Position.Z)).Magnitude
 	end
 	local speed = cfg.travelSpeed
-	if cfg.broomTravel and not cfg.underground and dist > 40 and W.broomOn() and os.clock() >= (W.slowUntil or 0) then speed = cfg.broomSpeed end
-	r = hrp()
-	-- follow the surface: above ground/roofs on the broom, or below the terrain
-	local function surfY(x, z)
-		if cfg.underground then local ty = terrainY(x, z) return ty and ty - cfg.undergroundDepth end
-		local gy = groundY(x, z) return gy and gy + cfg.flyHeight
+	if cfg.broomTravel and not cfg.underground and dist > 40 and W.broomOn() then speed = cfg.broomSpeed end
+	if cfg.underground then
+		local ok = W.glide(W.under(hrp().Position), speed, token)
+		ok = ok and W.glide(W.under(target), speed, token)
+		if W.undergroundArrive then return ok end
+		return ok and W.glide(target, speed, token)
 	end
-	local from = r.Position
-	local lastY = surfY(from.X, from.Z) or from.Y
-	local ok
-	ok, speed = W.glide(Vector3.new(from.X, lastY, from.Z), speed, token)
-	if not ok then return false end
-	local flat = Vector3.new(target.X - from.X, 0, target.Z - from.Z)
-	local n = math.max(1, math.floor(flat.Magnitude / 40))
-	local i = 0
-	while i < n do
-		i += 1
-		-- blink 3 waypoints (120 studs) ahead when stamina allows
-		if cfg.blinkTravel and n - i >= 4 and W.canBlink(cfg.blinkReserve) then
-			local j = i + 2
-			local bp = from + flat * (j / n)
-			local by = surfY(bp.X, bp.Z) or lastY
-			if W.blinkTo(Vector3.new(bp.X, by, bp.Z)) then lastY = by i = j + 1 end
-			if token ~= W.travelToken then return false end
-		end
-		local p = from + flat * (i / n)
-		local y = surfY(p.X, p.Z)
-		if y then
-			-- look a bit ahead so we climb before hills, never dip into them
-			local p2 = from + flat * math.min(1, (i + 1) / n)
-			local y2 = surfY(p2.X, p2.Z)
-			if y2 and not cfg.underground then y = math.max(y, y2) end
-			lastY = y
-		end
-		ok, speed = W.glide(Vector3.new(p.X, lastY, p.Z), speed, token)
-		if not ok then return false end
-	end
-	if W.undergroundArrive and cfg.underground then return true end
-	local done = W.glide(target, speed, token)
+	-- one smooth leg: constant horizontal speed, cruise over the highest ground ahead, land at the end
+	local done = W.fly(target, speed, token)
 	if done and cfg.dismountOnArrive then W.broomOff() end
 	return done
 end
@@ -1079,17 +1157,8 @@ function W.flee(reason)
 	W.stats.flees = (W.stats.flees or 0) + 1
 	local spot = W.safeSpot(500, 1800)
 	local r = hrp()
-	-- instant distance first: up to 3 blinks toward the escape spot
-	for _ = 1, 3 do
-		local rr = hrp()
-		if not rr or not W.canBlink(0) then break end
-		local dir = Vector3.new(spot.X - rr.Position.X, 0, spot.Z - rr.Position.Z)
-		if dir.Magnitude < 150 then break end
-		local to = rr.Position + dir.Unit * 120
-		local gy = groundY(to.X, to.Z)
-		W.blinkTo(Vector3.new(to.X, math.max((gy or to.Y) + 4, rr.Position.Y), to.Z))
-		task.wait(0.35)
-	end
+	-- instant distance first: a full blink burst (~600 studs in ~3s)
+	W.blinkBurst(spot, nil)
 	r = hrp()
 	-- Apparate is instant, use it if it's off cooldown and we can afford the HP
 	local sp = apparateSpell()
@@ -1571,11 +1640,10 @@ local pT = page("Travel")
 header(pT, "settings")
 number(pT, "Glide speed (no broom, safe <=60)", "travelSpeed", 5, 20, 65)
 toggle(pT, "Ride broom while travelling (faster)", "broomTravel")
-number(pT, "Broom glide speed", "broomSpeed", 5, 40, 160)
+number(pT, "Broom flight speed (<=140 clean)", "broomSpeed", 5, 40, 140)
 toggle(pT, "Travel/wait underground (out of view)", "underground")
 number(pT, "Underground depth", "undergroundDepth", 1, 6, 60)
-toggle(pT, "Dash-blink 120 studs while travelling", "blinkTravel")
-number(pT, "Keep dash stamina", "blinkReserve", 1, 0, 66)
+toggle(pT, "Blink burst at trip start (~230 studs/s)", "blinkTravel")
 toggle(pT, "Use Apparate for long trips", "useApparate")
 number(pT, "Apparate when farther than", "apparateMin", 50, 200, 5000)
 header(pT, "go to")
