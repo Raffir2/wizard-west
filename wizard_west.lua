@@ -42,6 +42,7 @@ local cfg = {
 	wagonLoot = true,       -- open unlocked wagon loot while farming
 	bossFarm = false,       -- bandit mission farm (combat)
 	autoMine = false,       -- mine ore veins (needs Vocare Pickaxe)
+	mineMinRate = 25,       -- $/s a gem trip must beat to leave the camps (4 gems up ~ $40/s)
 	autoContracts = true,
 	autoHop = true,
 	protectBaron = true,    -- while holding the Baron: no heists, flee at +10% HP         -- hostile server (many flees/deaths, low income) -> ask the watchdog to rejoin elsewhere
@@ -623,6 +624,13 @@ function W._travel(goal, above, exact)
 		r = hrp()
 		dist = (target - r.Position).Magnitude
 	end
+	-- inside the Crystal Cave the broom hits the rock ceiling (the server yanks us back): walk out first
+	if dist > 40 and W.inCave() then
+		W.exitCave(token)
+		if token ~= W.travelToken then return false end
+		r = hrp()
+		dist = (Vector3.new(target.X, 0, target.Z) - Vector3.new(r.Position.X, 0, r.Position.Z)).Magnitude
+	end
 	-- a blink burst covers the first ~600 studs in ~3s, the broom does the rest
 	if cfg.blinkTravel and dist > 200 and not (char() and char():GetAttribute("JetPacking")) then
 		local nb = W.blinkBurst(target, nil, token)
@@ -734,6 +742,7 @@ function W.walkIn(target)
 		return false
 	end
 	W.entryCache[key] = from
+	W.lastWalkFrom = from
 	W.travel(from, 0, true)
 	W.broomOff()
 	task.wait(0.3)
@@ -1106,36 +1115,241 @@ local function castSpell(sp, aimPos)
 end
 W.castSpell = castSpell
 
-function W.mineOnce()
-	local best, bd
+-- Gem Veins sit in the Crystal Cave (SpiderCave: rock ceiling at ~100-130, Nightfall spiders) and
+-- drop Ruby $450 or Diamond $1500 (~$710 avg); Coal Veins outside drop Coal ($100). A vein
+-- respawns ~83s after it breaks (10s server tick). The pickaxe lands a hit every ~0.9s for 7-34
+-- dmg (100-130 HP = ~5s per vein), can't be conjured on the broom and expires after ~40-70s.
+W.CAVE = Vector3.new(912, 60, -860)
+-- the cave mouth opens north onto a ravine (floor y 46, open sky); webs (west) and rock (east)
+-- cover the pit itself, flying down there gets us yanked back. Paths from here: 31-148 studs.
+W.CAVE_ENTRY = Vector3.new(896, 49, -764)
+W.mineSkip = {}
+local GEM_VALUE, COAL_VALUE = 710, 100
+local function veinUp(v) return v.Parent ~= nil and (v:GetAttribute("Health") or 0) > 0 end
+local function aiNear(p, rad)
+	local n = 0
+	for _, h in ipairs(CS:GetTagged("ActiveHumanoid")) do
+		local m = h.Parent
+		if m and m:GetAttribute("IsAI") and h.Health > 0 and m.PrimaryPart and (m.PrimaryPart.Position - p).Magnitude < rad then n += 1 end
+	end
+	return n
+end
+W.aiNear = aiNear
+function W.inCave()
 	local r = hrp()
-	for _, v in ipairs(workspace.Resources:GetChildren()) do
-		if (v:GetAttribute("Health") or 0) > 0 then
-			local d = (v:GetPivot().Position - r.Position).Magnitude
-			if not bd or d < bd then best, bd = v, d end
+	if not r then return false end
+	local p = r.Position
+	if p.Y > 95 or (Vector3.new(p.X, 0, p.Z) - Vector3.new(W.CAVE.X, 0, W.CAVE.Z)).Magnitude > 160 then return false end
+	rayP.FilterDescendantsInstances = { workspace.Characters, workspace.Entities, workspace.Particles }
+	return workspace:Raycast(p, Vector3.new(0, 150, 0), rayP) ~= nil
+end
+-- walk a navmesh path for real (Humanoid:MoveTo). Under a ceiling the broom gets yanked back, and
+-- gliding straight between waypoints clips through the tunnel floor: 43 rollbacks on one walk.
+function W.pathTo(goal, speed, token, untilFn)
+	local r = hrp()
+	if not r then return false end
+	local path = PFS:CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 6 })
+	local ok = pcall(function() path:ComputeAsync(r.Position - Vector3.new(0, 2.5, 0), goal) end)
+	if not (ok and path.Status == Enum.PathStatus.Success) then return false end
+	W.broomOff()
+	W.hoverPos = nil
+	if not token then W.travelToken += 1 token = W.travelToken end
+	local h = hum()
+	local ws = h.WalkSpeed
+	h.WalkSpeed = math.min(speed or 26, 30)
+	local res = pcall(function()
+		for _, wp in ipairs(path:GetWaypoints()) do
+			if token ~= W.travelToken or not alive() then error("stopped") end
+			if untilFn and untilFn() then return end
+			if wp.Action == Enum.PathWaypointAction.Jump then h.Jump = true end
+			h:MoveTo(wp.Position)
+			local t0, last, lastT = os.clock(), hrp().Position, os.clock()
+			while (Vector3.new(hrp().Position.X, 0, hrp().Position.Z) - Vector3.new(wp.Position.X, 0, wp.Position.Z)).Magnitude > 3 do
+				task.wait(0.05)
+				if token ~= W.travelToken or not alive() then error("stopped") end
+				local p = hrp().Position
+				if (p - last).Magnitude > 1 then last, lastT = p, os.clock() end
+				if os.clock() - lastT > 0.6 then h.Jump = true end -- a ledge
+				if os.clock() - lastT > 3 or os.clock() - t0 > 8 then error("stuck") end
+			end
+		end
+	end)
+	if hum() then hum().WalkSpeed = ws end
+	return (res and alive()) and true or false
+end
+-- walk back to the ravine (open sky) - stop as soon as nothing is overhead
+function W.exitCave(token)
+	if not W.inCave() then return true end
+	status("leaving the cave")
+	return W.pathTo(W.CAVE_ENTRY - Vector3.new(0, 3, 0), 30, token, function() return not W.inCave() end)
+end
+-- fight whatever AI is around (the combat loop shoots while W.farming); false only on low HP
+function W.clearAI(rad, maxT)
+	local t0 = os.clock()
+	W.farming = true
+	while alive() and aiNear(hrp().Position, rad) > 0 and os.clock() - t0 < maxT do
+		local h = hum()
+		if h.Health / h.MaxHealth * 100 < cfg.fleeHp then return false end
+		status("clearing spiders")
+		task.wait(0.3)
+	end
+	return alive()
+end
+local function getPickaxe()
+	local p = pickaxeTool()
+	if p then return p end
+	local w = wand()
+	local sp = w and w.Spells:FindFirstChild("Vocare Pickaxe")
+	if not sp then status("equip the Vocare Pickaxe spell first") task.wait(2) return end
+	W.broomOff()
+	local left = (sp:GetAttribute("CooldownExpire") or 0) - workspace:GetServerTimeNow()
+	if left > 0 then
+		if left > 16 then return end
+		task.wait(left + 0.1)
+	end
+	if not castSpell(sp) then return end
+	local t0 = os.clock()
+	repeat task.wait(0.2) p = pickaxeTool() until p or os.clock() - t0 > 2.5
+	return p
+end
+-- open ground ~7 studs from the vein, nearest to us (veins are excluded from the ray)
+function W.veinStand(v, vp, floorOnly)
+	local r = hrp()
+	local best, bd
+	local gem = floorOnly and v.Name == "Gem Vein"
+	rayP.FilterDescendantsInstances = { workspace.Characters, workspace.Entities, workspace.Particles, workspace.Resources }
+	for a = 0, 315, 45 do
+		local p = vp + Vector3.new(math.cos(math.rad(a)) * 7, 0, math.sin(math.rad(a)) * 7)
+		local hit = workspace:Raycast(p + Vector3.new(0, 12, 0), Vector3.new(0, -40, 0), rayP)
+		-- floorOnly: the cave floor (~21 below a gem's pivot) instead of the crystal ledge around it
+		if hit and math.abs(hit.Position.Y - vp.Y) < 25 and (not gem or hit.Position.Y < vp.Y - 12) then
+			local s = hit.Position + Vector3.new(0, 3, 0)
+			local d = r and (s - r.Position).Magnitude or 0
+			if not bd or d < bd then best, bd = s, d end
 		end
 	end
-	if not best then status("no ore vein up") task.wait(3) return end
-	local w = wand()
-	if not pickaxeTool() then
-		local sp = w and w.Spells:FindFirstChild("Vocare Pickaxe")
-		if not sp then status("equip Vocare Pickaxe spell first") task.wait(3) return end
-		castSpell(sp) task.wait(1.5)
+	if best then return best end
+	local flat = r and Vector3.new(r.Position.X - vp.X, 0, r.Position.Z - vp.Z)
+	return vp + ((flat and flat.Magnitude > 0.1) and flat.Unit or Vector3.new(0, 0, 1)) * 6
+end
+-- best vein by value per second (like the wagons). A trip into the cave (~15s walk-in) pays for
+-- every gem that's up, so gems are rated as a group until we're inside.
+function W.mineTarget(coalToo)
+	local r = hrp()
+	if not r then return end
+	local inCave = W.inCave()
+	local gemsUp = 0
+	for _, v in ipairs(workspace.Resources:GetChildren()) do
+		if v.Name == "Gem Vein" and veinUp(v) and os.clock() > (W.mineSkip[v] or 0) then gemsUp += 1 end
 	end
-	local vp = best:GetPivot().Position
-	W.travel(vp + Vector3.new(0, 0, 4), 1)
-	local pick = pickaxeTool()
-	if not pick then return end
-	equip(pick)
-	local t0 = os.clock()
-	while cfg.autoMine and best.Parent and (best:GetAttribute("Health") or 0) > 0 and os.clock() - t0 < 30 do
-		local rr = hrp()
-		W.hoverPos = nil
-		rr.CFrame = CFrame.new(rr.Position, Vector3.new(vp.X, rr.Position.Y, vp.Z))
-		pick:Activate()
-		task.wait(0.35)
+	local best, bd
+	for _, v in ipairs(workspace.Resources:GetChildren()) do
+		local gem = v.Name == "Gem Vein"
+		if veinUp(v) and (gem or coalToo) and os.clock() > (W.mineSkip[v] or 0) then
+			local p = v:GetPivot().Position
+			local d = (p - r.Position).Magnitude
+			-- coal ($100) only when it's close: a 2700-stud trip for it lost money on time
+			if p.Magnitude > 5 and (gem or d < 500) and #W.threats(cfg.workClear, p) == 0 then
+				local rate
+				if gem and not inCave then
+					-- measured: ~10s to land in the ravine + walk, ~10s per gem (walk, spiders, ~5s mining)
+					rate = gemsUp * GEM_VALUE / (d / 100 + 20 + gemsUp * 10)
+				else
+					rate = (gem and GEM_VALUE or COAL_VALUE) / (d / 100 + 8)
+				end
+				if not bd or rate > bd then best, bd = v, rate end
+			end
+		end
 	end
+	return best, bd or 0
+end
+function W.mineVein(v)
+	local vp = v:GetPivot().Position
+	if vp.Magnitude < 5 then return false end -- not streamed in
+	local gem = v.Name == "Gem Vein"
+	W.farming = true
+	W.hoverPos = nil
+	status(string.format("mining %s (%dm)", v.Name, (vp - hrp().Position).Magnitude))
+	local stand = W.veinStand(v, vp)
+	if gem then
+		if not W.inCave() and (hrp().Position - W.CAVE_ENTRY).Magnitude > 12 then
+			status("into the cave")
+			-- straight down from high above: a slanted landing crosses webs/rock and gets yanked back up
+			W.travel(W.CAVE_ENTRY + Vector3.new(0, 110, 0), 0, true)
+			if (Vector3.new(hrp().Position.X, 0, hrp().Position.Z) - Vector3.new(W.CAVE_ENTRY.X, 0, W.CAVE_ENTRY.Z)).Magnitude > 20 then return false end
+			W.broomOff()
+			W.glide(W.CAVE_ENTRY, 30)
+			if (hrp().Position - W.CAVE_ENTRY).Magnitude > 12 then W.log[#W.log + 1] = "mine: descent failed" return false end
+		end
+		W.broomOff()
+		stand = W.veinStand(v, vp) -- from where we landed
+		-- the ledge around the vein is in pickaxe reach (floor spots are ~20 below the pivot)
+		-- the navmesh doesn't reach the ledge: walk to the floor below it, then straight up and over
+		if (stand - hrp().Position).Magnitude > 6 and not W.pathTo(stand - Vector3.new(0, 3, 0)) then
+			local ledge = stand
+			stand = W.veinStand(v, vp, true)
+			if W.pathTo(stand - Vector3.new(0, 3, 0)) then
+				local p = hrp().Position
+				W.glide(Vector3.new(p.X, ledge.Y + 1, p.Z), 20)
+				W.glide(ledge, 15)
+				stand = ledge
+			else
+				stand = nil
+			end
+		end
+		if not stand then
+			stand = W.veinStand(v, vp)
+			W.log[#W.log + 1] = string.format("mine: no walk to (%d,%d,%d) from (%d,%d,%d)", stand.X, stand.Y, stand.Z, hrp().Position.X, hrp().Position.Y, hrp().Position.Z)
+			W.mineSkip[v] = os.clock() + 30
+			return false
+		end
+	else
+		if (stand - hrp().Position).Magnitude > 40 then W.travel(stand, 0, true) end
+		W.broomOff()
+		W.glide(stand, 30)
+	end
+	if not alive() or (Vector3.new(vp.X, 0, vp.Z) - Vector3.new(hrp().Position.X, 0, hrp().Position.Z)).Magnitude > 12 or math.abs(vp.Y - hrp().Position.Y) > 24 then
+		W.log[#W.log + 1] = string.format("mine: ended %.0f from %s", alive() and (vp - hrp().Position).Magnitude or -1, v.Name)
+		W.mineSkip[v] = os.clock() + 30
+		return false
+	end
+	-- spiders first: swinging with them on us cost half our HP in 3s (the far ones can't see us)
+	if aiNear(hrp().Position, 45) > 0 and not W.clearAI(45, 20) then return false end
+	local pick = getPickaxe()
+	if not pick then return false end
+	W.swinging = true
+	local hp0 = v:GetAttribute("Health")
+	pcall(function()
+		local t0 = os.clock()
+		while veinUp(v) and pick.Parent and alive() and os.clock() - t0 < 25 do
+			-- a hit lands every ~0.9s: nothing after 5s = out of reach
+			if os.clock() - t0 > 5 and v:GetAttribute("Health") == hp0 then
+				W.log[#W.log + 1] = string.format("mine: no damage from %.0f/%.0f away", (Vector3.new(vp.X, 0, vp.Z) - Vector3.new(hrp().Position.X, 0, hrp().Position.Z)).Magnitude, hrp().Position.Y - vp.Y)
+				W.mineSkip[v] = os.clock() + 30
+				break
+			end
+			if #W.realThreats() > 0 then break end
+			if aiNear(hrp().Position, 25) > 0 then
+				W.swinging = false
+				if not W.clearAI(45, 20) then break end
+				W.swinging = true
+			end
+			if pick.Parent ~= char() then hum():EquipTool(pick) task.wait(0.1) end
+			local rr = hrp()
+			W.hoverPos = nil
+			-- gems: the crystal ledge doesn't hold us, and from the floor (19 below) nothing lands: pin
+			local at = (gem and stand) and stand or rr.Position
+			rr.AssemblyLinearVelocity = Vector3.zero
+			rr.CFrame = CFrame.new(at, Vector3.new(vp.X, at.Y, vp.Z))
+			pick:Activate()
+			task.wait(0.3)
+		end
+	end)
+	W.swinging = false
+	if veinUp(v) then return false end
 	W.stats.mined = (W.stats.mined or 0) + 1
+	W.stats.mineValue = (W.stats.mineValue or 0) + (gem and GEM_VALUE or COAL_VALUE)
+	return true
 end
 
 -- contracts / skill tree / equip
@@ -1284,7 +1498,7 @@ local function validTarget(m)
 		-- leave other players alone: picking fights with rogues just ends in flees
 		local legal = isWanted(pl, m)
 		if W.attackers and W.attackers[pl] and os.clock() < W.attackers[pl] then return legal end
-		if not cfg.aimPlayers or (cfg.bossFarm and W.farming) then return false end
+		if not cfg.aimPlayers or ((cfg.bossFarm or cfg.autoMine) and W.farming) then return false end
 		if cfg.onlyWanted and not isWanted(pl, m) then return false end
 		return true
 	end
@@ -2125,11 +2339,23 @@ W.farmFn = function()
 		task.wait(1)
 		return
 	end
+	-- in the cave with gems up: finish them before any sell trip
+	if cfg.autoMine and not W.iAmWanted() and W.inCave() then
+		W.br = "mine"
+		local v = W.mineTarget(false)
+		if v then W.mineVein(v) return end
+	end
 	-- never leave a fight to sell: only when no bandit is in range
 	W.br = "sell"
 	-- no usable seller (players camping them while we're wanted): keep working instead of retrying
 	if cfg.autoSell and trinkets() >= cfg.sellAt and farmingAny and not W.findTarget(260) and W.sellWorthIt() then
 		W.sellTrinkets() return
+	end
+	-- gem veins: ~4 x $710 every ~90s in the Crystal Cave; worth a detour when the rate beats the camps
+	W.br = "mine"
+	if cfg.autoMine and not W.iAmWanted() then
+		local v, rate = W.mineTarget(false)
+		if v and (W.inCave() or rate >= cfg.mineMinRate or not cfg.bossFarm) then W.mineVein(v) return end
 	end
 	W.br = "wagons"
 	if cfg.wagonLoot and farmingAny then
@@ -2230,7 +2456,19 @@ W.farmFn = function()
 	end
 	-- nothing better to do: bank chests even without the artifact
 	if (cfg.bankChests or cfg.artifactFarm) and W.heist(true) then return end
-	if cfg.autoMine then W.mineOnce() return end
+	-- nothing else: coal ($100) or wait for the gems at the cave, clearing the spiders ($~100 each)
+	if cfg.autoMine and not W.iAmWanted() then
+		local v = W.mineTarget(true)
+		if v then W.mineVein(v) return end
+		if not W.inCave() and (hrp().Position - W.CAVE_ENTRY).Magnitude > 60 then
+			status("mining: to the cave")
+			W.travel(W.CAVE_ENTRY, 0, true)
+		end
+		status("mining: waiting for veins")
+		W.clearAI(90, 5)
+		task.wait(1)
+		return
+	end
 	status("idle")
 end
 spawnLoop("farm", W.farmFn)
@@ -2259,6 +2497,8 @@ spawnLoop("combat", function()
 		if cfg.autoHeal then W.healStep() end
 		return
 	end
+	-- mining: the pickaxe must stay in hand (the miner stops swinging to let us fight)
+	if W.swinging then return end
 	local need = cfg.silentAim or cfg.autoFire or cfg.autoSpells or cfg.bossFarm
 	local attacker = cfg.fightBack and W.attackerTarget()
 	W.target = attacker or (need and W.findTarget((cfg.bossFarm and W.farming) and 260 or nil)) or nil
@@ -2275,8 +2515,8 @@ spawnLoop("combat", function()
 	W.armorStep()
 	-- wanted: every bandit kill adds +25 bounty (measured) -> hold fire until the bounty is cleared
 	if W.iAmWanted() then return end
-	if W.target and (cfg.autoFire or cfg.autoSpells or cfg.bossFarm) then
-		if cfg.bossFarm and W.farming then
+	if W.target and (cfg.autoFire or cfg.autoSpells or cfg.bossFarm or cfg.autoMine) then
+		if (cfg.bossFarm or cfg.autoMine) and W.farming then
 			local a, b = cfg.autoFire, cfg.autoSpells
 			cfg.autoFire, cfg.autoSpells = true, true
 			W.attackStep()
@@ -2541,7 +2781,8 @@ button(pF, "Run one heist now (chests even without artifact)", function() W.heis
 toggle(pF, "Open rescue wagons (trinkets ~$1-1.5k)", "wagonLoot")
 toggle(pF, "Bandit mission farm (combat)", "bossFarm", function(v) if not v then W.farming = false W.hoverPos = nil end end)
 number(pF, "Fight distance from bandit", "fightDistance", 1, 8, 120)
-toggle(pF, "Auto mine ore (needs Vocare Pickaxe)", "autoMine")
+toggle(pF, "Mine gems in the Crystal Cave (Ruby $450 / Diamond $1500; needs Vocare Pickaxe)", "autoMine")
+number(pF, "Mining: gem trip must beat ($/s, camps ~25)", "mineMinRate", 5, 5, 100)
 header(pF, "safety")
 toggle(pF, "Flee from dangerous players", "avoidPlayers")
 number(pF, "Danger radius", "dangerRadius", 10, 40, 400)
@@ -2656,6 +2897,7 @@ function W.infoText()
 	for k, v in pairs(W.lootByKind or {}) do kk[#kk + 1] = string.format("%s %d/$%d", k, v.n, v.v) end
 	add("loot: %s", #kk > 0 and table.concat(kk, "  ") or "-")
 	add("opened %d | sold %d ($%d) | heists %d | walk-ins %d | rollbacks %d", W.stats.opened or 0, W.stats.sells or 0, W.stats.sellMoney or 0, W.stats.heists or 0, W.stats.walkIns or 0, W.stats.rollbacks or 0)
+	add("mined %d veins (~$%d) | in cave %s", W.stats.mined or 0, W.stats.mineValue or 0, tostring(W.inCave()))
 	add("")
 	add("recent trips:")
 	for i = 1, math.min(5, #(W.trips or {})) do add("  %s", W.trips[i]) end
