@@ -1425,7 +1425,12 @@ local UTIL_PRIO = { Episkios = 2, ["Royal Apparate"] = 100, Apparate = 95, Lasso
 -- Matrificus: rarity 1 but 18 dmg cone every 3s = ~3x the dps of the 15s-cooldown spells
 -- Wild Magic (2 slots): Vocaralea's +25 HP stays (player bursts of ~106 dmg killed us at 125 HP),
 -- Inlisus (lightning AoE + stun, 8s cd) over Ignisium (15s cd)
-local SPELL_ADJ = { Matrificus = 30, Bombarda = 8, Ignisio = 6, Ignisium = 8, Inlisus = 20, Vocaralea = 35, Expulso = -15, Aquarcia = -5, Haste = -12 }
+-- wiki numbers (every one we could check matched our HitNumberEvent readings): Electrificus 88 instant / 8s
+-- (~11 dps), Matrificus 35 multi / 3s, Inlisus 79 AoE / 8s, Bombarda 70 AoE / 16s (slow, no tracking),
+-- Severo(Diffindo) 70 piercing / 18s, Frigidus 44 AoE / 15s. Conjured weapons (Vocare Enarma/Halberda)
+-- and Bolt's 3-shot burst need extra handling the auto-caster doesn't do -> kept out.
+local SPELL_ADJ = { Electrificus = 28, Matrificus = 30, Bombarda = 8, Ignisio = 6, Ignisium = 8, Inlisus = 20, Vocaralea = 35, Expulso = -15, Aquarcia = -5, Haste = -12,
+	["Vocare Enarma"] = -40, ["Vocare Halberda"] = -30, Bolt = -5, Protego = -40, Frigidus = -5, Acidus = -15 }
 local function statSum(it)
 	local st = it:FindFirstChild("ItemStats")
 	local n = 0
@@ -1487,8 +1492,11 @@ end
 function W._autoEquip()
 	local want = W.desiredLoadout()
 	local changed = false
-	for it, on in pairs(want) do -- unequip first to free slots
-		if not on and it:GetAttribute("Equipped") then Events.InventoryEvent:FireServer(it) task.wait(0.9) changed = true end
+	-- unequip first to free slots. The server ignores unequipping an item whose cooldown is running
+	-- (verified): those wait for the next pass (every 15s)
+	local now = workspace:GetServerTimeNow()
+	for it, on in pairs(want) do
+		if not on and it:GetAttribute("Equipped") and (it:GetAttribute("CooldownExpire") or 0) <= now then Events.InventoryEvent:FireServer(it) task.wait(0.9) changed = true end
 	end
 	for it, on in pairs(want) do
 		if on and not it:GetAttribute("Equipped") then Events.InventoryEvent:FireServer(it) task.wait(0.9) changed = true end
@@ -2918,6 +2926,9 @@ function W.infoText()
 	add("loot: %s", #kk > 0 and table.concat(kk, "  ") or "-")
 	add("opened %d | sold %d ($%d) | heists %d | walk-ins %d | rollbacks %d", W.stats.opened or 0, W.stats.sells or 0, W.stats.sellMoney or 0, W.stats.heists or 0, W.stats.walkIns or 0, W.stats.rollbacks or 0)
 	add("mined %d veins (~$%d) | in cave %s", W.stats.mined or 0, W.stats.mineValue or 0, tostring(W.inCave()))
+	local wx = {}
+	for k, e in pairs(W.weatherIncome or {}) do if e.secs > 60 then wx[#wx + 1] = string.format("%s %.0fk/h (%dmin)", k, e.money / e.secs * 3.6, e.secs / 60) end end
+	add("weather now %s (%ss) | income by weather: %s", tostring(game.Lighting:GetAttribute("CurrentWeather") or "none"), tostring(game.Lighting:GetAttribute("WeatherTime")), #wx > 0 and table.concat(wx, ", ") or "-")
 	add("")
 	add("recent trips:")
 	for i = 1, math.min(5, #(W.trips or {})) do add("  %s", W.trips[i]) end
@@ -2959,6 +2970,27 @@ conn(UIS.InputBegan, function(i, gp)
 end)
 
 -- live stats line
+-- weather: Lighting.CurrentWeather (Daybreak = Imperials, Nightfall = spider waves, Rainfall, nil)
+-- every ~16 min for 5 min (WeatherTime counts down; negative while it's on). Income per weather
+-- state + the mission list at each change go to ww_weather.txt to see what the events are worth.
+W.weatherIncome = {}
+spawnLoop("weather", function()
+	local wx = game.Lighting:GetAttribute("CurrentWeather") or "none"
+	local m = money()
+	if W._wxLast and W._wxMoney then
+		local e = W.weatherIncome[W._wxLast] or { money = 0, secs = 0 }
+		e.money += m - W._wxMoney
+		e.secs += os.clock() - W._wxT
+		W.weatherIncome[W._wxLast] = e
+	end
+	if wx ~= W._wxLast then
+		local ms = {}
+		for _, mm in ipairs(workspace.Missions:GetChildren()) do ms[#ms + 1] = string.format("%s(%s)", mm.Name, tostring(mm:GetAttribute("EnemiesLeft"))) end
+		logf("ww_weather.txt", string.format("[%s] %s -> %s | money %d | missions %s", os.date("%H:%M:%S"), tostring(W._wxLast), wx, m, table.concat(ms, " ")))
+	end
+	W._wxLast, W._wxMoney, W._wxT = wx, m, os.clock()
+	task.wait(5)
+end)
 spawnLoop("stats", function()
 	task.wait(1)
 	local mins = (os.clock() - W.stats.startTime) / 60
