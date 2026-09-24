@@ -30,10 +30,11 @@ local cfg = {
 	vacuum = true,          -- collect every money/scroll drop on the map
 	autoSell = true,        -- walk to a trinket seller when the bag is worth enough
 	sellAt = 1,             -- sell when bag holds >= this many trinkets
-	nobleGrab = true,       -- take noble artifacts (Crown/Baron/Phoenix/Cloak) when they spawn
+	nobleGrab = true,
+	noblePrefer = "Baron",  -- swap to this artifact when it spawns (Baron = Royal Apparate)       -- take noble artifacts (Crown/Baron/Phoenix/Cloak) when they spawn
 	bankChests = true,      -- bank chests at artifact missions (trinkets, +200 bounty each -> auto cleared)
-	artifactFarm = false,   -- also steal the artifact (+1000 bounty, Diamond after 30s held)
-	heistClear = 150,       -- skip the heist while a rogue is this close to the loot
+	artifactFarm = true,    -- also steal the artifact (+1000 bounty, Diamond $1500 after 30s held)
+	heistClear = 300,       -- skip the heist while a rogue is this close to the loot
 	heistNeedApparate = true, -- only grab the artifact when Apparate is ready for the escape
 	wagonLoot = true,       -- open unlocked wagon loot while farming
 	bossFarm = false,       -- bandit mission farm (combat)
@@ -42,7 +43,7 @@ local cfg = {
 	-- safety
 	avoidPlayers = true,    -- flee from dangerous players
 	dangerRadius = 130,     -- a dangerous player this close -> leave
-	fleeHp = 45,            -- HP% at which farming stops and we retreat
+	fleeHp = 35,            -- HP% at which farming stops and we retreat
 	layLow = true,
 	autoClearBounty = true, -- RogueEvent: bounty + rogue status wiped after a 40s countdown
 	fightBack = true,       -- silent-aim + spells on players who attack us          -- while wanted (bounty), hide far from players until it clears
@@ -853,7 +854,7 @@ local function equippedCount(cat)
 end
 -- best loadout: strongest gear per slot, strongest spells, useful utilities
 local function isHealName(n) return n:find("Episki") ~= nil end
-local UTIL_PRIO = { ["Royal Apparate"] = 100, Apparate = 95, Lasso = 80, ["Open Sesame"] = 75, Stealio = 70, ["Invisio Maxima"] = 65, Invisio = 60, Wingardius = 55, Vocifero = 20, Revelio = 30, Repairo = 5, Lumo = 1 }
+local UTIL_PRIO = { Episkios = 2, ["Royal Apparate"] = 100, Apparate = 95, Lasso = 80, ["Open Sesame"] = 75, Stealio = 70, ["Invisio Maxima"] = 65, Invisio = 60, Wingardius = 55, Vocifero = 20, Revelio = 30, Repairo = 5, Lumo = 1 }
 -- measured on bandits: Bombarda one-shots 40hp, Ignisio 30 dmg cone (30 studs), Expulso 0 dmg (disarm only)
 local SPELL_ADJ = { Bombarda = 8, Ignisio = 6, Ignisium = 8, Expulso = -15, Aquarcia = -5, Haste = -12 }
 local function statSum(it)
@@ -865,6 +866,12 @@ end
 function W.desiredLoadout()
 	local want = {}
 	local byCat = {}
+	-- only the single best self-heal earns the "always carry a heal" bonus
+	local bestHeal, bestHealR
+	for _, it in ipairs(Concept.Inventory:GetChildren()) do
+		local d = Directory.Items[it.Name]
+		if d and d.Catagory == "Spells" and isHealName(it.Name) and (not bestHealR or (d.Rarity or 1) > bestHealR) then bestHeal, bestHealR = it, d.Rarity or 1 end
+	end
 	for _, it in ipairs(Concept.Inventory:GetChildren()) do
 		local d = Directory.Items[it.Name]
 		if d then
@@ -878,7 +885,7 @@ function W.desiredLoadout()
 				if it.Name == "Vocare Pickaxe" then score = cfg.autoMine and 90 or 3 end
 			elseif cat == "Spells" or cat == "Wild Magic" then
 				score = (d.Rarity or 1) * 10
-				if isHealName and isHealName(it.Name) then score += 25 end -- always carry a heal
+				if it == bestHeal then score += 25 elseif isHealName(it.Name) then score -= 15 end
 				score += SPELL_ADJ[it.Name] or 0
 			end
 			if score then
@@ -1307,7 +1314,7 @@ function W.flee(reason)
 	while alive() and os.clock() - t0 < 60 do
 		local hh = hum()
 		local pct = hh.Health / hh.MaxHealth * 100
-		if pct >= cfg.fleeHp + 20 or #W.realThreats() > 0 then break end
+		if pct >= cfg.fleeHp + 15 or #W.realThreats() > 0 then break end
 		local w = wand()
 		for _, s in ipairs((w and w.Spells:GetChildren()) or {}) do
 			if isHeal(s.Name) and spellReady(s) then castSpell(s) break end
@@ -1485,7 +1492,13 @@ spawnLoop("farm", function()
 	if lp.Backpack:FindFirstChild("Artifact") or (char() and char():FindFirstChild("Artifact")) then waitArtifact() return end
 	-- wanted: sell loot if the seller is clear, otherwise hide until the bounty clears
 	if cfg.nobleGrab then
-		for _, p in ipairs(W.nobleTargets()) do if W.grabNoble(p) then return end end
+		-- each artifact gives its own noble spell and replaces the one you hold:
+		-- Baron = Royal Apparate (12s map teleport, the farming one), Cloak = Invisio Maxima, ...
+		local mine = lp:GetAttribute("Noble")
+		for _, p in ipairs(W.nobleTargets()) do
+			local kind = p.Parent and p.Parent.Name
+			if (not mine or (kind == cfg.noblePrefer and mine ~= kind)) and W.grabNoble(p) then return end
+		end
 	end
 	if (cfg.bankChests or cfg.artifactFarm) and W.heist() then return end
 	if W.iAmWanted() then W.clearBounty() end
