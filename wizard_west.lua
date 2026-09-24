@@ -2504,7 +2504,7 @@ W.farmFn = function()
 			W.hunt.why = holder.Name .. ": " .. (ok and "go" or why)
 			if ok and W.assassinate(holder) then return end
 		else
-			W.hunt.why = holder and "we hold it" or "nobody holds it"
+			W.hunt.why = lp:GetAttribute("Noble") == "Baron" and "we hold it" or "nobody holds it"
 		end
 	end
 	if cfg.nobleGrab then
