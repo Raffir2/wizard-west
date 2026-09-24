@@ -71,6 +71,7 @@ local cfg = {
 	autoFire = false,
 	autoSpells = false,
 	autoHeal = true,
+	keepArmor = true,       -- keep Vocaralea armor (+25 max HP) up
 	healAt = 55,
 	farmHeight = 18,        -- hover height above bandits
 	-- player
@@ -309,11 +310,14 @@ function W.fly(goal, speed, token, opts)
 	local done, ok = false, true
 	local c
 	-- highest ground between here and `look` studs ahead (sampled every 12 studs, cached 0.25s)
-	local function cruiseY(pos, dir, remain)
-		if os.clock() - profT < 0.25 and prof then return prof end
-		profT = os.clock()
+	-- without the broom the server rubber-bands anything hovering, so hug the ground then
+	local profJet
+	local function cruiseY(pos, dir, remain, jet)
+		if os.clock() - profT < (jet and 0.25 or 0.1) and prof and profJet == jet then return prof end
+		profT, profJet = os.clock(), jet
 		local top = -math.huge
-		for d = 0, math.min(look, remain), 12 do
+		local clear = jet and clear or 3.5
+		for d = 0, math.min(jet and look or 24, remain), jet and 12 or 6 do
 			local p = pos + dir * d
 			local gy = groundY(p.X, p.Z)
 			if gy and gy > top then top = gy end
@@ -356,11 +360,11 @@ function W.fly(goal, speed, token, opts)
 		local step = math.min(sp * dt, remain)
 		local nx, nz = cur.X + dir.X * step, cur.Z + dir.Z * step
 		-- vertical: cruise height ahead, but descend onto the goal over the last stretch
-		local want = cruiseY(Vector3.new(nx, 0, nz), dir, remain) or cur.Y
+		local want = cruiseY(Vector3.new(nx, 0, nz), dir, remain, jet ~= nil) or cur.Y
 		local finalApproach = opts.descend ~= false and remain < math.max(60, (cur.Y - goal.Y) * 1.6)
 		if finalApproach then want = goal.Y end
 		local dy = want - cur.Y
-		local vmax = (dy > 0 and vUp or (finalApproach and 60 or vDown)) * dt
+		local vmax = (dy > 0 and vUp or ((finalApproach or not jet) and 60 or vDown)) * dt
 		local ny = cur.Y + math.clamp(dy, -vmax, vmax)
 		cur = Vector3.new(nx, ny, nz)
 		rr.AssemblyLinearVelocity = Vector3.zero
@@ -793,6 +797,8 @@ end
 -- best loadout: strongest gear per slot, strongest spells, useful utilities
 local function isHealName(n) return n:find("Episki") ~= nil end
 local UTIL_PRIO = { ["Royal Apparate"] = 100, Apparate = 95, Lasso = 80, ["Open Sesame"] = 75, Stealio = 70, ["Invisio Maxima"] = 65, Invisio = 60, Wingardius = 55, Vocifero = 20, Revelio = 30, Repairo = 5, Lumo = 1 }
+-- measured on bandits: Bombarda one-shots 40hp, Ignisio 30 dmg cone (30 studs), Expulso 0 dmg (disarm only)
+local SPELL_ADJ = { Bombarda = 8, Ignisio = 6, Ignisium = 8, Expulso = -15, Aquarcia = -5, Haste = -12 }
 local function statSum(it)
 	local st = it:FindFirstChild("ItemStats")
 	local n = 0
@@ -816,6 +822,7 @@ function W.desiredLoadout()
 			elseif cat == "Spells" or cat == "Wild Magic" then
 				score = (d.Rarity or 1) * 10
 				if isHealName and isHealName(it.Name) then score += 25 end -- always carry a heal
+				score += SPELL_ADJ[it.Name] or 0
 			end
 			if score then
 				byCat[cat] = byCat[cat] or {}
@@ -936,7 +943,7 @@ do
 	end
 end
 
-local UTIL = { Apparate = true, ["Royal Apparate"] = true, ["Vocare Pickaxe"] = true, Lumo = true, Revelio = true, ["Open Sesame"] = true, Haste = true, Invisio = true, ["Invisio Maxima"] = true, Vocaralea = true, Wingardius = true, Protego = true, Expresso = true, ["Noctous Maxima"] = true, Lasso = true, Lasso2 = true }
+local UTIL = { Expulso = true, Aquarcia = true, Apparate = true, ["Royal Apparate"] = true, ["Vocare Pickaxe"] = true, Lumo = true, Revelio = true, ["Open Sesame"] = true, Haste = true, Invisio = true, ["Invisio Maxima"] = true, Vocaralea = true, Wingardius = true, Protego = true, Expresso = true, ["Noctous Maxima"] = true, Lasso = true, Lasso2 = true }
 local function isHeal(n) return n:find("Episki") ~= nil end
 function W.offensiveSpells()
 	local w = wand()
@@ -969,6 +976,15 @@ function W.attackStep()
 	if cfg.autoFire then w:Activate() end
 end
 
+-- Vocaralea (Wild Magic) is a toggle: +25 max HP (ConjuredArmor) while on; cast only when off
+function W.armorStep()
+	local c = char()
+	if not cfg.keepArmor or not c or c:GetAttribute("ConjuredArmor") or c:GetAttribute("CastingSpell") or c:GetAttribute("JetPacking") or W.travelling then return end
+	if os.clock() - (W.lastArmor or 0) < 5 then return end
+	local w = wand()
+	local sp = w and w.Spells:FindFirstChild("Vocaralea")
+	if sp and spellReady(sp) then W.lastArmor = os.clock() castSpell(sp) end
+end
 function W.healStep()
 	local h = hum()
 	if not h or h.Health / h.MaxHealth * 100 > cfg.healAt then return end
@@ -1413,6 +1429,7 @@ spawnLoop("combat", function()
 		return
 	end
 	if cfg.autoHeal then W.healStep() end
+	W.armorStep()
 	if W.target and (cfg.autoFire or cfg.autoSpells or cfg.bossFarm) then
 		if cfg.bossFarm and W.farming then
 			local a, b = cfg.autoFire, cfg.autoSpells
@@ -1698,6 +1715,7 @@ header(pC, "auto")
 toggle(pC, "Auto fire wand at target", "autoFire")
 toggle(pC, "Auto cast offensive spells", "autoSpells")
 toggle(pC, "Auto heal (Episkio*)", "autoHeal")
+toggle(pC, "Keep Vocaralea armor up (+25 HP)", "keepArmor")
 number(pC, "Heal below HP %", "healAt", 5, 5, 95)
 
 -- Player / Visual
