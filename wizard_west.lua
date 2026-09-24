@@ -30,7 +30,9 @@ local cfg = {
 	vacuum = true,          -- collect every money/scroll drop on the map
 	autoSell = true,        -- walk to a trinket seller when the bag is worth enough
 	sellAt = 1,             -- sell when bag holds >= this many trinkets
-	artifactFarm = false,   -- open artifact-mission chests + artifact (gives bounty!)
+	artifactFarm = false,   -- bank heist: artifact-mission chests + artifact (gives bounty!)
+	heistClear = 150,       -- skip the heist while a rogue is this close to the loot
+	heistNeedApparate = true, -- only grab the artifact when Apparate is ready for the escape
 	wagonLoot = true,       -- open unlocked wagon loot while farming
 	bossFarm = false,       -- bandit mission farm (combat)
 	autoMine = false,       -- mine ore veins (needs Vocare Pickaxe)
@@ -223,7 +225,7 @@ function W.apparate(goal)
 	if not (sp and c and h) then return false end
 	if workspace:GetServerTimeNow() < (sp:GetAttribute("CooldownExpire") or 0) then return false end
 	-- keep enough HP after the cost so we don't trip the low-HP retreat
-	if (h.Health - (sp:GetAttribute("HealthCost") or 50)) / h.MaxHealth * 100 < math.max(cfg.fleeHp + 10, 15) then return false end
+	if (h.Health - (sp:GetAttribute("HealthCost") or 50)) / h.MaxHealth * 100 <= math.max(cfg.fleeHp, 10) then return false end
 	if (c:GetAttribute("DashStamina") or 0) < (sp:GetAttribute("StamCost") or 33) then return false end
 	W.hoverPos = nil
 	equip(w)
@@ -343,6 +345,16 @@ local function trinkets()
 end
 W.trinkets = trinkets
 
+-- is the seller we'd use free of other players? (while wanted everyone can hit us)
+function W.sellerClear()
+	local p = W.wanted_seller and W.wanted_seller() or SELLERS[2]
+	for _, pl in ipairs(Players:GetPlayers()) do
+		local m = pl.Character
+		if pl ~= lp and m and m.PrimaryPart and (m.PrimaryPart.Position - p).Magnitude < 150 then return false end
+	end
+	return true
+end
+
 -- selling happens automatically (client Dialog loop) once you stand inside a
 -- DialogConfig part; we just go there and step into it.
 function W.sellTrinkets()
@@ -428,16 +440,23 @@ end
 local function waitArtifact()
 	local a = lp.Backpack:FindFirstChild("Artifact") or (char() and char():FindFirstChild("Artifact"))
 	if not a then return end
-	status("holding artifact " .. tostring(a:GetAttribute("TimeLeft")) .. "s")
-	-- stay up in the air while it ticks (people hunt the bounty)
-	local r = hrp()
-	local gy = groundY(r.Position.X, r.Position.Z)
-	W.hoverPos = cfg.underground and W.under(r.Position) or Vector3.new(r.Position.X, (gy or r.Position.Y) + 3, r.Position.Z)
-	W.glide(W.hoverPos, cfg.travelSpeed)
 	local t0 = os.clock()
-	while a.Parent and os.clock() - t0 < 40 do task.wait(0.5) end
+	while a.Parent and os.clock() - t0 < 45 and alive() do
+		status("holding artifact " .. tostring(a:GetAttribute("TimeLeft")) .. "s")
+		if #W.threats(cfg.dangerRadius + 60) > 0 then
+			W.hoverPos = nil
+			local spot = W.safeSpot(400, 1600)
+			if not W.apparate(spot) then W.travel(spot, 3) end
+		elseif not W.hoverPos then
+			local r = hrp()
+			local gy = groundY(r.Position.X, r.Position.Z)
+			W.hoverPos = Vector3.new(r.Position.X, (gy or r.Position.Y) + 3, r.Position.Z)
+		end
+		task.wait(0.5)
+	end
 	W.hoverPos = nil
 end
+W.waitArtifact = waitArtifact
 
 -- mining
 local function pickaxeTool()
@@ -535,16 +554,60 @@ local function equippedCount(cat)
 	end
 	return n
 end
-function W.autoEquipSpells()
+-- best loadout: strongest gear per slot, strongest spells, useful utilities
+local function isHealName(n) return n:find("Episki") ~= nil end
+local UTIL_PRIO = { ["Royal Apparate"] = 100, Apparate = 95, Lasso = 80, ["Open Sesame"] = 75, Stealio = 70, ["Invisio Maxima"] = 65, Invisio = 60, Wingardius = 55, Vocifero = 20, Revelio = 30, Repairo = 5, Lumo = 1 }
+local function statSum(it)
+	local st = it:FindFirstChild("ItemStats")
+	local n = 0
+	if st then for _, v in pairs(st:GetAttributes()) do if type(v) == "number" then n += v end end end
+	return n
+end
+function W.desiredLoadout()
+	local want = {}
+	local byCat = {}
 	for _, it in ipairs(Concept.Inventory:GetChildren()) do
 		local d = Directory.Items[it.Name]
-		if d and not it:GetAttribute("Equipped") and (d.Catagory == "Spells" or d.Catagory == "Wild Magic" or d.Catagory == "Utility Spells") then
-			if equippedCount(d.Catagory) < (Directory.InventoryEquipSlots[d.Catagory] or 0) then
-				Events.InventoryEvent:FireServer(it)
-				task.wait(1)
+		if d then
+			local cat = d.Catagory
+			local score
+			if cat == "Equipment" then
+				cat = "Eq:" .. tostring(d.EquipCatagory)
+				score = statSum(it) * 10 + (d.Rarity or 0)
+			elseif cat == "Utility Spells" then
+				score = UTIL_PRIO[it.Name] or 10
+				if it.Name == "Vocare Pickaxe" then score = cfg.autoMine and 90 or 3 end
+			elseif cat == "Spells" or cat == "Wild Magic" then
+				score = (d.Rarity or 1) * 10
+				if isHealName and isHealName(it.Name) then score += 25 end -- always carry a heal
+			end
+			if score then
+				byCat[cat] = byCat[cat] or {}
+				table.insert(byCat[cat], { it = it, score = score })
 			end
 		end
 	end
+	for cat, list in pairs(byCat) do
+		table.sort(list, function(a, b) return a.score > b.score end)
+		local slots = cat:sub(1, 3) == "Eq:" and 1 or (Directory.InventoryEquipSlots[cat] or 0)
+		for i, e in ipairs(list) do
+			-- gear without stats is cosmetic: keep whatever is worn there
+			if cat:sub(1, 3) == "Eq:" and e.score < 10 and i == 1 then break end
+			want[e.it] = i <= slots
+		end
+	end
+	return want
+end
+function W.autoEquipSpells()
+	local want = W.desiredLoadout()
+	local changed = false
+	for it, on in pairs(want) do -- unequip first to free slots
+		if not on and it:GetAttribute("Equipped") then Events.InventoryEvent:FireServer(it) task.wait(0.9) changed = true end
+	end
+	for it, on in pairs(want) do
+		if on and not it:GetAttribute("Equipped") then Events.InventoryEvent:FireServer(it) task.wait(0.9) changed = true end
+	end
+	return changed
 end
 
 -------------------------------------------------------------------------------
@@ -726,7 +789,7 @@ spawnLoop("safety", function()
 	-- took damage while a hostile player is around -> danger
 	if lastHp and h.Health < lastHp - 1 and #W.threats(300) > 0 then W.dangerUntil = os.clock() + 20 end
 	lastHp = h.Health
-	if cfg.avoidPlayers and #W.threats(cfg.dangerRadius) > 0 then W.dangerUntil = math.max(W.dangerUntil, os.clock() + 8) end
+	if cfg.avoidPlayers and #W.threats(W.heistActive and 45 or cfg.dangerRadius) > 0 then W.dangerUntil = math.max(W.dangerUntil, os.clock() + 8) end
 	local lowHp = h.Health / h.MaxHealth * 100 < cfg.fleeHp
 	local danger = cfg.avoidPlayers and (os.clock() < W.dangerUntil or lowHp)
 	if danger and not W.fleeing and (cfg.bossFarm or cfg.artifactFarm or cfg.autoMine or W.travelling) then
@@ -735,27 +798,40 @@ spawnLoop("safety", function()
 end)
 
 -- point far away from every other player (candidates: known places + rings around us)
-function W.safeSpot(minFrom)
+local MAP_MIN, MAP_MAX = Vector2.new(-1850, -1750), Vector2.new(2250, 2380)
+local TOWN = Vector3.new(220, 75, -330) -- police/MoL: deadly while wanted
+-- point far away from every other player; avoids town while wanted and bandit camps
+function W.safeSpot(minFrom, maxFrom)
 	local r = hrp()
+	local me = r.Position
+	local wanted = W.iAmWanted()
 	local cands = {}
-	for _, p in pairs(W.places) do cands[#cands + 1] = p end
-	for i = 0, 7 do
-		local a = i * math.pi / 4
-		cands[#cands + 1] = r.Position + Vector3.new(math.cos(a), 0, math.sin(a)) * (minFrom or 450)
+	for x = MAP_MIN.X, MAP_MAX.X, 300 do
+		for z = MAP_MIN.Y, MAP_MAX.Y, 300 do cands[#cands + 1] = Vector3.new(x, me.Y, z) end
 	end
+	local others = {}
+	for _, pl in ipairs(Players:GetPlayers()) do
+		if pl ~= lp and pl.Character and pl.Character.PrimaryPart then others[#others + 1] = pl.Character.PrimaryPart.Position end
+	end
+	local camps = {}
+	for _, m in ipairs(workspace.Missions:GetChildren()) do if m:IsA("Model") then camps[#camps + 1] = m:GetPivot().Position end end
 	local best, bs
 	for _, c in ipairs(cands) do
-		local nearest = math.huge
-		for _, pl in ipairs(Players:GetPlayers()) do
-			if pl ~= lp and pl.Character and pl.Character.PrimaryPart then
-				nearest = math.min(nearest, (pl.Character.PrimaryPart.Position - c).Magnitude)
-			end
+		local d = (Vector3.new(c.X, 0, c.Z) - Vector3.new(me.X, 0, me.Z)).Magnitude
+		if d >= (minFrom or 0) and d <= (maxFrom or math.huge) then
+			local nearest = 1500
+			for _, o in ipairs(others) do nearest = math.min(nearest, (Vector3.new(o.X, 0, o.Z) - Vector3.new(c.X, 0, c.Z)).Magnitude) end
+			local score = nearest - d * 0.1
+			if wanted and (Vector3.new(c.X, 0, c.Z) - Vector3.new(TOWN.X, 0, TOWN.Z)).Magnitude < 800 then score -= 2000 end
+			for _, cp in ipairs(camps) do if (cp - c).Magnitude < 300 then score -= 400 end end
+			if not bs or score > bs then best, bs = c, score end
 		end
-		local travelCost = (c - r.Position).Magnitude * 0.15
-		local score = math.min(nearest, 900) - travelCost
-		if groundY(c.X, c.Z) and (not bs or score > bs) then best, bs = c, score end
 	end
-	return best or r.Position
+	if best then
+		local gy = groundY(best.X, best.Z)
+		best = Vector3.new(best.X, gy or math.max(me.Y, 120), best.Z)
+	end
+	return best or me
 end
 
 function W.flee(reason)
@@ -763,7 +839,7 @@ function W.flee(reason)
 	W.hoverPos = nil
 	status("FLEE: " .. reason)
 	W.stats.flees = (W.stats.flees or 0) + 1
-	local spot = W.safeSpot(500)
+	local spot = W.safeSpot(500, 1800)
 	local r = hrp()
 	-- Apparate is instant, use it if it's off cooldown and we can afford the HP
 	local sp = apparateSpell()
@@ -790,6 +866,95 @@ function W.flee(reason)
 end
 
 -------------------------------------------------------------------------------
+-- bank heist (artifact missions spawn at King's Bank / Wizards Bank)
+-------------------------------------------------------------------------------
+local function isArtifactPrompt(p) return p.Parent and p.Parent.Name == "Artifact" end
+local function apparateReady()
+	local sp = apparateSpell()
+	local h, c = hum(), char()
+	if not (sp and h and c) then return false end
+	return workspace:GetServerTimeNow() >= (sp:GetAttribute("CooldownExpire") or 0)
+		and (h.Health - (sp:GetAttribute("HealthCost") or 50)) / h.MaxHealth * 100 > math.max(cfg.fleeHp, 10)
+end
+W.apparateReady = apparateReady
+
+function W.heist()
+	local targets = W.artifactTargets()
+	if #targets == 0 then return false end
+	table.sort(targets, function(a, b) return (isArtifactPrompt(a) and 1 or 0) < (isArtifactPrompt(b) and 1 or 0) end)
+	local site = mdlPos(targets[1].Parent)
+	-- scout: someone hostile camping the loot?
+	for _, pl in ipairs(Players:GetPlayers()) do
+		local m = pl.Character
+		if pl ~= lp and m and m.PrimaryPart and (m.PrimaryPart.Position - site).Magnitude < cfg.heistClear then
+			if pl:GetAttribute("Rogue") or m:GetAttribute("Rogued") or (pl:GetAttribute("Bounty") or 0) > 0 then
+				status("heist: rogue " .. pl.Name .. " at the bank, waiting")
+				W.hoverPos = nil
+				return false
+			end
+		end
+	end
+	-- the artifact makes us the most wanted person on the server: only grab it with the escape ready
+	local wantArtifact = false
+	for _, p in ipairs(targets) do if isArtifactPrompt(p) then wantArtifact = true end end
+	W.heistActive = true
+	W.stats.heists = (W.stats.heists or 0) + 1
+	for _, p in ipairs(targets) do
+		if not alive() then break end
+		if isArtifactPrompt(p) then
+			if not apparateReady() and cfg.heistNeedApparate then
+				status("heist: waiting for Apparate before the artifact")
+				local sp = apparateSpell()
+				local t0 = os.clock()
+				while not apparateReady() and os.clock() - t0 < 70 and alive() do task.wait(0.5) end
+			end
+			status("heist: artifact")
+			W.openPrompt(p)
+			task.wait(0.6)
+			-- escape far away right away
+			local spot = W.safeSpot(1000, 3200)
+			status("heist: escaping")
+			if not W.apparate(spot) then W.travel(spot, 3) end
+		else
+			status("heist: chest")
+			W.openPrompt(p)
+		end
+	end
+	W.heistActive = false
+	return true
+end
+
+-- death log: the game stamps THF_<faction> (time hit by faction) on characters
+W.deaths = {}
+local function hookDeath(c)
+	local h = c:WaitForChild("Humanoid", 10)
+	if not h then return end
+	h.Died:Connect(function()
+		local thf = {}
+		for k, v in pairs(c:GetAttributes()) do
+			if k:sub(1, 4) == "THF_" then thf[#thf + 1] = k:sub(5) .. "@" .. string.format("%.1f", v) end
+		end
+		local near = {}
+		local r = c.PrimaryPart
+		for _, pl in ipairs(Players:GetPlayers()) do
+			local m = pl.Character
+			if pl ~= lp and r and m and m.PrimaryPart and (m.PrimaryPart.Position - r.Position).Magnitude < 250 then
+				near[#near + 1] = string.format("%s(%dm%s)", pl.Name, (m.PrimaryPart.Position - r.Position).Magnitude, (pl:GetAttribute("Rogue") or m:GetAttribute("Rogued")) and ",rogue" or "")
+			end
+		end
+		local e = string.format("[%s] died at %s while '%s' | hit by: %s (gt %.1f) | near: %s | bounty %s",
+			os.date("%H:%M:%S"), r and tostring(Vector3.new(math.floor(r.Position.X), math.floor(r.Position.Y), math.floor(r.Position.Z))) or "?",
+			tostring(W.status), table.concat(thf, ", "), workspace.DistributedGameTime, table.concat(near, ", "), tostring(lp:GetAttribute("Bounty")))
+		W.deaths[#W.deaths + 1] = e
+		pcall(appendfile, "ww_deaths.txt", e .. "\n")
+		W.hoverPos = nil
+		W.heistActive = false
+	end)
+end
+if lp.Character then task.spawn(hookDeath, lp.Character) end
+conn(lp.CharacterAdded, hookDeath)
+
+-------------------------------------------------------------------------------
 -- main farm loop
 -------------------------------------------------------------------------------
 spawnLoop("farm", function()
@@ -797,7 +962,7 @@ spawnLoop("farm", function()
 	if not alive() then W.hoverPos = nil task.wait(1) return end
 	if cfg.autoContracts then W.claimContracts() end
 	if cfg.autoBuy then W.autoBuyStep() end
-	if cfg.autoEquipSpells then W.autoEquipSpells() end
+	if cfg.autoEquipSpells and os.clock() - (W.lastEquip or 0) > 15 then W.lastEquip = os.clock() W.autoEquipSpells() end
 
 	local farmingAny = cfg.artifactFarm or cfg.bossFarm or cfg.autoMine
 	if farmingAny and cfg.avoidPlayers then
@@ -806,15 +971,17 @@ spawnLoop("farm", function()
 		if h.Health / h.MaxHealth * 100 < cfg.fleeHp then W.flee("low hp") return end
 	end
 	if lp.Backpack:FindFirstChild("Artifact") or (char() and char():FindFirstChild("Artifact")) then waitArtifact() return end
-	-- wanted and not deliberately farming bounty loot: hide until the bounty clears
-	if farmingAny and cfg.layLow and W.iAmWanted() and not cfg.artifactFarm then
+	-- wanted: sell loot if the seller is clear, otherwise hide until the bounty clears
+	if W.iAmWanted() and (farmingAny) and cfg.layLow then
+		if cfg.autoSell and trinkets() > 0 and W.sellerClear() then W.sellTrinkets() return end
 		local spot = W.hoverPos
 		if not spot or #W.threats(400) > 0 then
 			W.hoverPos = nil
-			local s2 = W.safeSpot(600)
-			W.travel(s2, 3)
-			local gy = groundY(s2.X, s2.Z)
-			W.hoverPos = Vector3.new(hrp().Position.X, (gy or hrp().Position.Y) + 3, hrp().Position.Z)
+			local s2 = W.safeSpot(300, 2000)
+			if (s2 - hrp().Position).Magnitude > 900 and W.apparateReady() then W.apparate(s2) else W.travel(s2, 3) end
+			local r = hrp()
+			local gy = groundY(r.Position.X, r.Position.Z)
+			W.hoverPos = Vector3.new(r.Position.X, (gy or r.Position.Y) + 3, r.Position.Z)
 		end
 		status(string.format("wanted ($%d) - laying low", lp:GetAttribute("Bounty") or 0))
 		task.wait(1)
@@ -824,10 +991,7 @@ spawnLoop("farm", function()
 	if cfg.autoSell and trinkets() >= cfg.sellAt and farmingAny and not W.findTarget(260) then
 		W.sellTrinkets() return
 	end
-	if cfg.artifactFarm then
-		local t = W.artifactTargets()
-		if #t > 0 then status("artifact loot") W.openPrompt(t[1]) return end
-	end
+	if cfg.artifactFarm and W.heist() then return end
 	if cfg.wagonLoot and (cfg.artifactFarm or cfg.bossFarm) then
 		local t = W.wagonTargets()
 		if #t > 0 then status("wagon loot") W.openPrompt(t[1]) return end
@@ -1106,7 +1270,8 @@ header(pF, "money")
 toggle(pF, "Vacuum all money/scroll drops (map-wide)", "vacuum", applyVacuum)
 toggle(pF, "Auto sell trinkets", "autoSell")
 number(pF, "Sell when trinkets >=", "sellAt", 1, 1, 50)
-toggle(pF, "Artifact missions (chests+artifact, BOUNTY!)", "artifactFarm")
+toggle(pF, "Bank heist (chests + artifact, gives BOUNTY)", "artifactFarm")
+button(pF, "Run one heist now", function() local a = cfg.avoidPlayers W.heist() end)
 toggle(pF, "Open unlocked wagon loot", "wagonLoot")
 toggle(pF, "Bandit mission farm (combat)", "bossFarm", function(v) if not v then W.farming = false W.hoverPos = nil end end)
 number(pF, "Fight distance from bandit", "fightDistance", 1, 8, 120)
