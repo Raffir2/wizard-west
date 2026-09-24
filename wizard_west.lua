@@ -1163,6 +1163,9 @@ function W.pathTo(goal, speed, token, untilFn)
 	local h = hum()
 	local ws = h.WalkSpeed
 	h.WalkSpeed = math.min(speed or 26, 30)
+	-- the combat loop's casts (InplaceCast) freeze us: at the cave mouth spiders kept it casting and
+	-- every walk to the nearest gem died as "stuck" after 3s (1.8s walk with the loop paused)
+	W.walking = true
 	local res = pcall(function()
 		for _, wp in ipairs(path:GetWaypoints()) do
 			if token ~= W.travelToken or not alive() then error("stopped") end
@@ -1174,12 +1177,14 @@ function W.pathTo(goal, speed, token, untilFn)
 				task.wait(0.05)
 				if token ~= W.travelToken or not alive() then error("stopped") end
 				local p = hrp().Position
-				if (p - last).Magnitude > 1 then last, lastT = p, os.clock() end
+				local cc = char()
+				if (p - last).Magnitude > 1 or (cc and (cc:GetAttribute("CastingSpell") or cc:GetAttribute("InplaceCast"))) then last, lastT = p, os.clock() end
 				if os.clock() - lastT > 0.6 then h.Jump = true end -- a ledge
 				if os.clock() - lastT > 3 or os.clock() - t0 > 8 then error("stuck") end
 			end
 		end
 	end)
+	W.walking = false
 	if hum() then hum().WalkSpeed = ws end
 	return (res and alive()) and true or false
 end
@@ -1290,11 +1295,11 @@ function W.mineVein(v)
 			-- ready (or about to be) or nobody dangerous anywhere near
 			local sp = apparateSpell()
 			local cdLeft = sp and (sp:GetAttribute("CooldownExpire") or 0) - workspace:GetServerTimeNow() or 999
-			if cdLeft > 5 and #W.threats(1500, W.CAVE) > 0 then W.mineSkip[v] = os.clock() + 20 return false end
+			if cdLeft > 5 and #W.threats(1500, W.CAVE) > 0 then W.mineSkip[v] = os.clock() + 20 W.log[#W.log + 1] = "mine: no escape (Apparate cd) with threats near the cave" return false end
 			status("into the cave")
 			-- straight down from high above: a slanted landing crosses webs/rock and gets yanked back up
 			W.travel(W.CAVE_ENTRY + Vector3.new(0, 110, 0), 0, true)
-			if (Vector3.new(hrp().Position.X, 0, hrp().Position.Z) - Vector3.new(W.CAVE_ENTRY.X, 0, W.CAVE_ENTRY.Z)).Magnitude > 20 then return false end
+			if (Vector3.new(hrp().Position.X, 0, hrp().Position.Z) - Vector3.new(W.CAVE_ENTRY.X, 0, W.CAVE_ENTRY.Z)).Magnitude > 20 then W.log[#W.log + 1] = "mine: trip to the cave aborted" return false end
 			-- the server sometimes rolls the descent back (we "land", then snap back up ~100): check
 			-- after a moment and go again; the last stretch slower
 			for _ = 1, 2 do
@@ -1309,8 +1314,14 @@ function W.mineVein(v)
 		W.broomOff()
 		stand = W.veinStand(v, vp) -- from where we landed
 		-- the ledge around the vein is in pickaxe reach (floor spots are ~20 below the pivot)
+		-- already in reach (the swing pins us onto the ledge): no walk. Standing on the crystals next
+		-- to a vein, every path out of there is NoPath and the vein used to be skipped.
+		local function near(maxH)
+			local p = hrp().Position
+			return (Vector3.new(vp.X, 0, vp.Z) - Vector3.new(p.X, 0, p.Z)).Magnitude <= maxH and math.abs(vp.Y - p.Y) <= 24
+		end
 		-- the navmesh doesn't reach the ledge: walk to the floor below it, then straight up and over
-		if (stand - hrp().Position).Magnitude > 6 and not W.pathTo(stand - Vector3.new(0, 3, 0)) then
+		if not near(10) and (stand - hrp().Position).Magnitude > 6 and not W.pathTo(stand - Vector3.new(0, 3, 0)) and not near(20) then
 			local ledge = stand
 			stand = W.veinStand(v, vp, true)
 			if W.pathTo(stand - Vector3.new(0, 3, 0)) then
@@ -1318,6 +1329,8 @@ function W.mineVein(v)
 				W.glide(Vector3.new(p.X, ledge.Y + 1, p.Z), 20)
 				W.glide(ledge, 15)
 				stand = ledge
+			elseif near(20) then
+				stand = ledge -- close enough: the swing pins us there
 			else
 				stand = nil
 			end
@@ -1333,30 +1346,33 @@ function W.mineVein(v)
 		W.broomOff()
 		W.glide(stand, 30)
 	end
-	if not alive() or (Vector3.new(vp.X, 0, vp.Z) - Vector3.new(hrp().Position.X, 0, hrp().Position.Z)).Magnitude > 12 or math.abs(vp.Y - hrp().Position.Y) > 24 then
+	if not alive() or (Vector3.new(vp.X, 0, vp.Z) - Vector3.new(hrp().Position.X, 0, hrp().Position.Z)).Magnitude > (gem and 20 or 12) or math.abs(vp.Y - hrp().Position.Y) > 24 then
 		W.log[#W.log + 1] = string.format("mine: ended %.0f from %s", alive() and (vp - hrp().Position).Magnitude or -1, v.Name)
 		W.mineSkip[v] = os.clock() + 30
 		return false
 	end
 	-- spiders first: swinging with them on us cost half our HP in 3s (the far ones can't see us)
-	if aiNear(hrp().Position, 45) > 0 and not W.clearAI(45, 20) then return false end
+	if aiNear(hrp().Position, 45) > 0 and not W.clearAI(45, 20) then W.log[#W.log + 1] = "mine: spider clear aborted (hp/danger)" return false end
 	local pick = getPickaxe()
-	if not pick then return false end
+	if not pick then W.log[#W.log + 1] = "mine: no pickaxe (cast failed / cooldown)" return false end
 	W.swinging = true
 	local hp0 = v:GetAttribute("Health")
+	local why = "timeout"
 	pcall(function()
 		local t0 = os.clock()
 		while veinUp(v) and pick.Parent and alive() and os.clock() - t0 < 25 do
 			-- a hit lands every ~0.9s: nothing after 5s = out of reach
 			if os.clock() - t0 > 5 and v:GetAttribute("Health") == hp0 then
 				W.log[#W.log + 1] = string.format("mine: no damage from %.0f/%.0f away", (Vector3.new(vp.X, 0, vp.Z) - Vector3.new(hrp().Position.X, 0, hrp().Position.Z)).Magnitude, hrp().Position.Y - vp.Y)
-				W.mineSkip[v] = os.clock() + 30
+				-- out of reach from where the server has us (the gem on the shelf north of the pit: the
+				-- navmesh runs under the shelf, the pin onto it isn't accepted): leave it for 5 min
+				W.mineSkip[v] = os.clock() + 300
 				break
 			end
-			if #W.realThreats() > 0 or os.clock() < W.dangerUntil then break end
+			if #W.realThreats() > 0 or os.clock() < W.dangerUntil then why = "player threat" break end
 			if aiNear(hrp().Position, 25) > 0 then
 				W.swinging = false
-				if not W.clearAI(45, 20) then break end
+				if not W.clearAI(45, 20) then why = "spiders (hp/danger)" break end
 				W.swinging = true
 			end
 			if pick.Parent ~= char() then hum():EquipTool(pick) task.wait(0.1) end
@@ -1371,7 +1387,11 @@ function W.mineVein(v)
 		end
 	end)
 	W.swinging = false
-	if veinUp(v) then return false end
+	if veinUp(v) then
+		if not pick.Parent then why = "pickaxe expired" elseif not alive() then why = "died" end
+		W.log[#W.log + 1] = string.format("mine: stopped (%s), vein %s/%s", why, tostring(v:GetAttribute("Health")), tostring(hp0))
+		return false
+	end
 	W.stats.mined = (W.stats.mined or 0) + 1
 	W.stats.mineValue = (W.stats.mineValue or 0) + (gem and GEM_VALUE or COAL_VALUE)
 	return true
@@ -2804,7 +2824,7 @@ spawnLoop("combat", function()
 		return
 	end
 	-- mining: the pickaxe must stay in hand (the miner stops swinging to let us fight)
-	if W.swinging or W.defending then return end
+	if W.swinging or W.defending or W.walking then return end
 	local need = cfg.silentAim or cfg.autoFire or cfg.autoSpells or cfg.bossFarm
 	local attacker = cfg.fightBack and W.attackerTarget()
 	W.target = attacker or (need and W.findTarget((cfg.bossFarm and W.farming) and 260 or nil)) or nil
