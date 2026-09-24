@@ -523,7 +523,7 @@ function W.fly(goal, speed, token, opts)
 		local finalApproach = opts.descend ~= false and remain < math.max(60, (cur.Y - goal.Y) * 1.6)
 		if finalApproach then want = goal.Y end
 		local dy = want - cur.Y
-		local vmax = (dy > 0 and vUp or (finalApproach and 60 or (not jet and 35) or vDown)) * dt
+		local vmax = (dy > 0 and vUp or (finalApproach and 40 or (not jet and 35) or vDown)) * dt
 		local ny = cur.Y + math.clamp(dy, -vmax, vmax)
 		W.lastVy = dt > 0 and (ny - cur.Y) / dt or 0
 		cur = Vector3.new(nx, ny, nz)
