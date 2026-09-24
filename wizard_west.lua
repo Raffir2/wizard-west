@@ -54,8 +54,10 @@ local cfg = {
 	autoClearBounty = true, -- RogueEvent: bounty + rogue status wiped after a 40s countdown
 	useCloak = true,        -- Invisio / Invisio Maxima (Cloak noble): stay invisible + off the radar except while shooting
 	fightBack = true,       -- silent-aim + spells on players who attack us          -- while wanted (bounty), hide far from players until it clears
-	autoBuy = false,        -- buy next skill-tree item automatically
-	buyOrder = { "ChMiner", "ChWayfarer", "ChCadet", "ChWater", "ChSnatcher", "ChFrost", "ChBlade", "ChFire", "ChMusket", "ChMoL", "ChStorm", "ChIronblood", "ChOcean", "ChVampire", "ChWukong", "ChMind", "ChDeath" },
+	autoBuy = true,         -- buy next skill-tree item automatically
+	-- only chapters worth saving for: Oceanus Vortico (wiki: strongest PvE crowd control, 70 dmg in a
+	-- 40-stud vortex + 5s trap). A list with more chapters spends the savings on the next cosmetic.
+	buyOrder = { "ChOcean" },
 	keepMoney = 0,          -- never spend below this
 	autoEquipSpells = true, -- equip newly bought spells into free slots
 	-- travel
