@@ -35,6 +35,7 @@ local cfg = {
 	bankChests = true,      -- bank chests at artifact missions (trinkets, +200 bounty each -> auto cleared)
 	artifactFarm = true,    -- also steal the artifact (+1000 bounty, Diamond $1500 after 30s held)
 	heistClear = 300,       -- skip the heist while a rogue is this close to the loot
+	workClear = 600,        -- camps/wagons: no rogue/hunter within this (they roam at broom speed)
 	heistNeedApparate = true, -- only grab the artifact when Apparate is ready for the escape
 	wagonLoot = true,       -- open unlocked wagon loot while farming
 	bossFarm = false,       -- bandit mission farm (combat)
@@ -42,10 +43,11 @@ local cfg = {
 	autoContracts = true,
 	-- safety
 	avoidPlayers = true,    -- flee from dangerous players
-	dangerRadius = 130,     -- a dangerous player this close -> leave
+	dangerRadius = 220,     -- a dangerous player this close (and closing in / attacking / <160) -> leave
 	fleeHp = 35,            -- HP% at which farming stops and we retreat
 	layLow = true,
 	autoClearBounty = true, -- RogueEvent: bounty + rogue status wiped after a 40s countdown
+	useCloak = true,        -- Invisio / Invisio Maxima (Cloak noble): stay invisible + off the radar except while shooting
 	fightBack = true,       -- silent-aim + spells on players who attack us          -- while wanted (bounty), hide far from players until it clears
 	autoBuy = false,        -- buy next skill-tree item automatically
 	buyOrder = { "ChMiner", "ChWayfarer", "ChCadet", "ChWater", "ChSnatcher", "ChFrost", "ChBlade", "ChFire", "ChMusket", "ChMoL", "ChStorm", "ChIronblood", "ChOcean", "ChVampire", "ChWukong", "ChMind", "ChDeath" },
@@ -57,6 +59,7 @@ local cfg = {
 	broomSpeed = 120,       -- smooth flight on the broom: 140 measured clean, 160 knocks you off
 	underground = false,    -- experimental: travel below the terrain (glitchy, broom can't run there)
 	flyHeight = 22,         -- broom cruise height above ground/roofs
+	flyAccel = 25,          -- studs/s^2 while speeding up on the broom
 	undergroundDepth = 14,
 	fightDistance = 24,     -- bandit farm: stand on the ground this far from the target
 	blinkTravel = false,    -- start trips with dash-blinks. OFF: the broom leg after a burst gets rolled back (30-55/s vs 120 clean)
@@ -259,10 +262,35 @@ function W.broomOn()
 	if not (b and b:FindFirstChild("ToolListnerEvent")) then return false end
 	if workspace:GetServerTimeNow() < (b:GetAttribute("CooldownExpire") or 0) then return false end
 	local h = hum()
+	-- the server refuses the broom on the ground (~20% of our mounts failed standing on grass/sand):
+	-- get airborne first and fire once we really are
 	if h then h:ChangeState(Enum.HumanoidStateType.Jumping) end
-	task.wait(0.2)
-	b.ToolListnerEvent:FireServer("Activate")
-	for _ = 1, 15 do task.wait(0.1) if c:GetAttribute("JetPacking") then return true end end
+	local r = hrp()
+	if r then r.AssemblyLinearVelocity = Vector3.new(r.AssemblyLinearVelocity.X, 45, r.AssemblyLinearVelocity.Z) end
+	for _ = 1, 6 do task.wait(0.05) if h and h.FloorMaterial == Enum.Material.Air then break end end
+	task.wait(0.1)
+	-- Activate is a server-side toggle: when the server still thinks we fly (the client dropped
+	-- JetPacking on its own) the first press turns it off -> press again once the cooldown passed
+	for attempt = 1, 2 do
+		b.ToolListnerEvent:FireServer("Activate")
+		for _ = 1, 10 do task.wait(0.1) if c:GetAttribute("JetPacking") then
+			if attempt > 1 then W.stats.broomRetryOk = (W.stats.broomRetryOk or 0) + 1 end
+			return true
+		end end
+		local tw = os.clock()
+		while workspace:GetServerTimeNow() < (b:GetAttribute("CooldownExpire") or 0) and os.clock() - tw < 2 do task.wait(0.05) end
+		if h and h.FloorMaterial ~= Enum.Material.Air and r then
+			h:ChangeState(Enum.HumanoidStateType.Jumping)
+			r.AssemblyLinearVelocity = Vector3.new(r.AssemblyLinearVelocity.X, 45, r.AssemblyLinearVelocity.Z)
+			task.wait(0.15)
+		end
+	end
+	-- why does the server refuse sometimes? log the state to find the rule
+	W.broomFails = W.broomFails or {}
+	table.insert(W.broomFails, 1, string.format("[%s] stam %s rogue %s rag %s floor %s hit %.0fs ago shot %.0fs ago cd %.1f cast %s", os.date("%H:%M:%S"),
+		tostring(c:GetAttribute("DashStamina")), tostring(c:GetAttribute("Rogued")), tostring(c:GetAttribute("Ragdoll")),
+		tostring(h and h.FloorMaterial.Name), os.clock() - (W.lastDamageT or 0), os.clock() - (W.lastShotT or 0), (b:GetAttribute("CooldownExpire") or 0) - workspace:GetServerTimeNow(), tostring(c:GetAttribute("CastingSpell"))))
+	if #W.broomFails > 20 then table.remove(W.broomFails) end
 	return false
 end
 
@@ -395,6 +423,9 @@ function W.fly(goal, speed, token, opts)
 	local prof, profT = nil, 0
 	local done, ok = false, true
 	local c
+	local floorY, floorAt
+	local upPulls = 0
+	W.flyBlocked = false
 	-- highest ground between here and `look` studs ahead (sampled every 12 studs, cached 0.25s)
 	-- without the broom the server rubber-bands anything hovering, so hug the ground then
 	local profJet
@@ -415,6 +446,12 @@ function W.fly(goal, speed, token, opts)
 		local rr = hrp()
 		if not rr or token ~= W.travelToken or os.clock() - t0 > maxT then ok = false done = true c:Disconnect() return end
 		local jet = char() and char():GetAttribute("JetPacking")
+		-- server-side ragdoll (we skip it on the client): movement now gets rolled back -> wait it out
+		if char():GetAttribute("Ragdoll") then
+			cur, lastSet = rr.Position, rr.Position
+			W.flySpeed = cfg.travelSpeed
+			return
+		end
 		local sp = speed
 		if not jet then
 			sp = math.min(sp, cfg.travelSpeed)
@@ -426,16 +463,36 @@ function W.fly(goal, speed, token, opts)
 		elseif cfg.broomTravel and rollbacks == 0 then
 			sp = math.max(sp, cfg.broomSpeed)
 		end
-		if os.clock() < (W.slowUntil or 0) then sp = math.min(sp, jet and 70 or 45) end
-		-- ramp up instead of jumping straight to full speed
-		W.flySpeed = math.min(sp, (W.flySpeed or cfg.travelSpeed) + 80 * dt)
+		if os.clock() < (W.slowUntil or 0) then sp = math.min(sp, jet and 95 or 45) end
+		-- ramp up gently: most rollbacks came 1-7s into a trip right after snapping to full speed
+		W.flySpeed = math.min(sp, (W.flySpeed or cfg.travelSpeed) + cfg.flyAccel * dt)
 		sp = W.flySpeed
-		if (rr.Position - lastSet).Magnitude > 35 then -- server pulled us back
-			rollbacks += 1
-			W.stats.rollbacks = (W.stats.rollbacks or 0) + 1
+		local back = (rr.Position - lastSet).Magnitude
+		if back > 35 then
+			W.rbLog = W.rbLog or {}
+			local up = rr.Position.Y - lastSet.Y
+			table.insert(W.rbLog, 1, string.format("t%.1f sp%d vy%d jet%s back%d up%d y%d rag%.0fs dmg%.0fs", os.clock() - t0, W.flySpeed or 0, W.lastVy or 0, tostring(jet ~= nil), back, up, cur.Y, os.clock() - (W.lastRagdollT or 0), os.clock() - (W.lastDamageT or 0)))
+			if #W.rbLog > 30 then table.remove(W.rbLog) end
+			-- pulled mostly UP: the server has something solid under us that our ray can't see
+			-- (invisible collision) -> don't try to go below it around here
+			if up > back * 0.6 then
+				floorY, floorAt = rr.Position.Y - 1, Vector3.new(rr.Position.X, 0, rr.Position.Z)
+				upPulls += 1
+				-- descending onto a spot under a roof: the server won't let us through it (anti-noclip),
+				-- every try is pulled back up -> give up instead of fighting it until the timeout
+				if upPulls >= 3 then W.flyBlocked = true ok = false done = true c:Disconnect() return end
+			end
 			cur = rr.Position
-			speed = math.max(40, speed * 0.8)
-			if rollbacks >= 2 then W.slowUntil = os.clock() + 30 end
+			-- a pull of hundreds of studs is a position desync (server snaps us to an old spot),
+			-- not a speed complaint: just carry on from where we are
+			if back < 300 then
+				rollbacks += 1
+				W.stats.rollbacks = (W.stats.rollbacks or 0) + 1
+				speed = math.max(40, speed * 0.8)
+				if rollbacks >= 2 then W.slowUntil = os.clock() + 12 end
+			else
+				W.stats.snaps = (W.stats.snaps or 0) + 1
+			end
 		end
 		local lv = rr:FindFirstChildOfClass("LinearVelocity")
 		if lv then lv.MaxForce = 0 end
@@ -447,11 +504,13 @@ function W.fly(goal, speed, token, opts)
 		local nx, nz = cur.X + dir.X * step, cur.Z + dir.Z * step
 		-- vertical: cruise height ahead, but descend onto the goal over the last stretch
 		local want = cruiseY(Vector3.new(nx, 0, nz), dir, remain, jet ~= nil) or cur.Y
+		if floorY and (Vector3.new(nx, 0, nz) - floorAt).Magnitude < 100 then want = math.max(want, floorY) end
 		local finalApproach = opts.descend ~= false and remain < math.max(60, (cur.Y - goal.Y) * 1.6)
 		if finalApproach then want = goal.Y end
 		local dy = want - cur.Y
 		local vmax = (dy > 0 and vUp or ((finalApproach or not jet) and 60 or vDown)) * dt
 		local ny = cur.Y + math.clamp(dy, -vmax, vmax)
+		W.lastVy = dt > 0 and (ny - cur.Y) / dt or 0
 		cur = Vector3.new(nx, ny, nz)
 		rr.AssemblyLinearVelocity = Vector3.zero
 		rr.CFrame = remain > 0.5 and CFrame.new(cur, cur + dir) or CFrame.new(cur) * (rr.CFrame - rr.CFrame.Position)
@@ -490,7 +549,7 @@ function W.apparate(goal, escaping)
 	sp:SetAttribute("SubEquipped", true)
 	w.ToolListnerEvent:FireServer("Activate", hrp().Position + hrp().CFrame.LookVector * 20, hrp().Position, sp)
 	local got = false
-	for _ = 1, 30 do task.wait(0.1) if c:GetAttribute("Apparating") then got = true break end end
+	for _ = 1, 15 do task.wait(0.1) if c:GetAttribute("Apparating") then got = true break end end
 	sp:SetAttribute("SubEquipped", nil)
 	if not got then return false end
 	Events.MapApparateEvent:FireServer(Vector3.new(goal.X, 0, goal.Z))
@@ -544,6 +603,7 @@ function W._travel(goal, above, exact)
 		dist = (Vector3.new(target.X, 0, target.Z) - Vector3.new(r.Position.X, 0, r.Position.Z)).Magnitude
 	end
 	local speed = cfg.travelSpeed
+	if dist > 150 and not W.noCloak and W.cloakUseful() then W.setCloak(true) end
 	if cfg.broomTravel and not cfg.underground and dist > 40 and W.broomOn() then speed = cfg.broomSpeed end
 	if cfg.underground then
 		local ok = W.glide(W.under(hrp().Position), speed, token)
@@ -564,6 +624,54 @@ function W.under(p)
 	return Vector3.new(p.X, ty - cfg.undergroundDepth, p.Z)
 end
 function W.stop() W.travelToken += 1 W.hoverPos = nil end
+
+-- Indoors (Baron/Crown spawn in the castle, some chests sit under roofs): landing straight down
+-- hits the roof and the server's anti-noclip keeps us on top. Land on open ground next to the
+-- building instead and walk the navmesh path in.
+local PFS = game:GetService("PathfindingService")
+W.roofCache = {}
+local function roofed(p)
+	local key = string.format("%d,%d,%d", p.X / 4, p.Y / 4, p.Z / 4)
+	if W.roofCache[key] ~= nil then return W.roofCache[key] end
+	-- far targets aren't streamed in: a roof we can't see is still a roof
+	local r = hrp()
+	if r and (r.Position - p).Magnitude > 300 then pcall(function() lp:RequestStreamAroundAsync(p, 3) end) end
+	rayP.FilterDescendantsInstances = { workspace.Characters, workspace.Entities, workspace.Particles }
+	local hit = workspace:Raycast(p + Vector3.new(0, 3, 0), Vector3.new(0, 120, 0), rayP) ~= nil
+	W.roofCache[key] = hit
+	return hit
+end
+W.roofed = roofed
+function W.walkIn(target)
+	local token = W.travelToken
+	local best
+	for rad = 25, 185, 20 do
+		for a = 0, 330, 30 do
+			local p = target + Vector3.new(math.cos(math.rad(a)) * rad, 0, math.sin(math.rad(a)) * rad)
+			local gy = groundY(p.X, p.Z)
+			if gy and math.abs(gy - target.Y) < 40 and not roofed(Vector3.new(p.X, gy, p.Z)) then best = Vector3.new(p.X, gy + 3, p.Z) break end
+		end
+		if best then break end
+	end
+	if not best then W.log[#W.log + 1] = "walkIn: no open ground near target" return false end
+	W.travel(best, 0, true)
+	W.broomOff()
+	task.wait(0.3)
+	local path = PFS:CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 8 })
+	local ok = pcall(function() path:ComputeAsync(hrp().Position - Vector3.new(0, 2.5, 0), target) end)
+	if not ok or path.Status ~= Enum.PathStatus.Success then
+		W.log[#W.log + 1] = "walkIn: no path (" .. tostring(path.Status) .. ")"
+		return false
+	end
+	W.travelToken += 1
+	token = W.travelToken
+	for _, wp in ipairs(path:GetWaypoints()) do
+		if token ~= W.travelToken or not alive() then return false end
+		W.glide(wp.Position + Vector3.new(0, 3, 0), 40, token)
+	end
+	W.stats.walkIns = (W.stats.walkIns or 0) + 1
+	return true
+end
 
 W.places = {
 	["Town / Tree book"] = Vector3.new(287, 73, -234),
@@ -700,9 +808,11 @@ function W.sellTrinkets()
 	local p = W.pickSeller()
 	if not p then status("sell: every seller has company") return false end
 	status(string.format("selling %d trinkets ($%d)", n, val))
+	W.setCloak(false) -- interactions fail while cloaked; can't toggle it on the broom later
 	-- fly at the seller part itself (glides pass through walls); fire the moment we're in range
 	local done, sold = false, false
-	task.spawn(function() W.travel(p, 0, true) done = true end)
+	W.noCloak = true
+	task.spawn(function() W.travel(p, 0, true) done = true W.noCloak = false end)
 	local t0 = os.clock()
 	while not done and os.clock() - t0 < 120 do
 		v = sellCfgInRange()
@@ -776,12 +886,23 @@ function W.openPrompt(p)
 		local gy = groundY(spot.X, spot.Z)
 		if not gy or gy > cf.Position.Y + 6 then gy = cf.Position.Y - size.Y / 2 end -- under a roof: use the loot's floor
 		local stand = Vector3.new(spot.X, gy + 3, spot.Z)
-		if first then W.travel(stand, 0, true) first = false else W.glide(stand, 30) end
+		if first then
+			if roofed(stand) then W.walkIn(stand) else W.travel(stand, 0, true) end
+			first = false
+		else
+			W.glide(stand, 30)
+		end
 		if not p.Parent then return false end
+		if W.flyBlocked then -- roof over the loot: skip it for a while
+			t.n = math.max(t.n, 2)
+			W.hoverPos = nil
+			return false
+		end
 		local r = hrp()
 		W.hoverPos = stand
 		if r then r.CFrame = CFrame.new(stand, Vector3.new(cf.Position.X, stand.Y, cf.Position.Z)) end
 		task.wait(0.3)
+		W.setCloak(false) -- prompts don't open while cloaked
 		fireproximityprompt(p)
 		local t0 = os.clock()
 		repeat task.wait(0.2) until openedByMe(p) or not p.Parent or os.clock() - t0 > 1.2 + p.HoldDuration
@@ -820,6 +941,7 @@ local function waitArtifact()
 	W.holdingArtifact = true
 	while a.Parent and os.clock() - t0 < 45 and alive() do
 		status("holding artifact " .. tostring(a:GetAttribute("TimeLeft")) .. "s")
+		W.setCloak(true)
 		-- +1000 bounty: everyone hunts us. React on the radar long before they're in range
 		-- (a rogue killed us at 5s left when we only reacted at 190 studs).
 		local th = W.threats(450)
@@ -895,9 +1017,12 @@ function W.mineOnce()
 end
 
 -- contracts / skill tree / equip
+W.contractTry = {}
 function W.claimContracts()
 	for _, c in ipairs(Concept.Contracts:GetChildren()) do
-		if not c:GetAttribute("Completed") and (c:GetAttribute("Value") or 0) >= (c:GetAttribute("Goal") or math.huge) then
+		-- a claim the server refuses would otherwise cost 1s on every farm loop
+		if not c:GetAttribute("Completed") and (c:GetAttribute("Value") or 0) >= (c:GetAttribute("Goal") or math.huge) and os.clock() - (W.contractTry[c] or -1e9) > 120 then
+			W.contractTry[c] = os.clock()
 			Events.ContractsEvent:FireServer(c)
 			task.wait(1)
 		end
@@ -1118,10 +1243,44 @@ function W.offensiveSpells()
 end
 local function spellReady(s) return workspace:GetServerTimeNow() >= (s:GetAttribute("CooldownExpire") or 0) end
 
+-- Invisio (the Cloak noble's Invisio Maxima) is a toggle (G_Cloak): see-through for others, gone
+-- from the map radar (MapEvent stops sending us), no bounty marker, skipped by aim assist. The wand
+-- can't fire while cloaked -> stay cloaked all the time except while we're shooting.
+local function cloakSpell()
+	local w = wand()
+	return w and (w.Spells:FindFirstChild("Invisio Maxima") or w.Spells:FindFirstChild("Invisio"))
+end
+-- the cast costs ~1s (+ uncloaking later): only when someone could come for us
+function W.cloakUseful()
+	if W.iAmWanted() or W.heistActive or W.holdingArtifact then return true end
+	local _, v = trinkets()
+	return v >= 1500 or #W.threats(1500) > 0
+end
+function W.setCloak(on)
+	local c = char()
+	if not c then return false end
+	if (c:GetAttribute("G_Cloak") == true) == on then return true end
+	if on and not cfg.useCloak then return false end
+	local sp = cloakSpell()
+	if not sp or not spellReady(sp) or c:GetAttribute("CastingSpell") or c:GetAttribute("JetPacking") then return false end
+	castSpell(sp)
+	for _ = 1, 10 do
+		task.wait(0.1)
+		if (c:GetAttribute("G_Cloak") == true) == on then
+			W.stats.cloaks = (W.stats.cloaks or 0) + 1
+			return true
+		end
+	end
+	return false
+end
+
 -- fire through the game's own tool path (keeps ammo/animations/cooldowns legit)
 function W.attackStep()
 	local c = char()
 	if not c or c:GetAttribute("CastingSpell") then return end
+	if not (cfg.autoSpells or cfg.autoFire) then return end
+	if c:GetAttribute("G_Cloak") then W.setCloak(false) return end
+	W.lastShotT = os.clock()
 	local w = wand()
 	if not w then return end
 	equip(w)
@@ -1160,18 +1319,21 @@ end
 -- bandit mission farm: hover above the camp, silent-aim everything
 function W.missionTarget()
 	local r = hrp()
-	local best, bd
-	for _, m in ipairs(workspace.Missions:GetChildren()) do
-		if m:IsA("Model") and not m:GetAttribute("Completed") and (m:GetAttribute("EnemiesLeft") or 0) > 0 then
-			-- clearing a camp unlocks its 2 rescue wagons: prefer the one that's done soonest
-			-- (flight ~120 studs/s, ~4s per bandit), skip camps with hostile players around
-			local mp = m:GetPivot().Position
-			local d = (mp - r.Position).Magnitude / 120 + m:GetAttribute("EnemiesLeft") * 4
-			if m.Name == "CowboyTest" then d -= 12 end -- Imperial camp: its wagons are the red chests
-			if #W.threats(200, mp) == 0 and (not bd or d < bd) then best, bd = m, d end
+	-- busy server: nothing clear by workClear -> accept camps with nobody within 300 rather than idle
+	for _, clear in ipairs({ cfg.workClear, 300 }) do
+		local best, bd
+		for _, m in ipairs(workspace.Missions:GetChildren()) do
+			if m:IsA("Model") and not m:GetAttribute("Completed") and (m:GetAttribute("EnemiesLeft") or 0) > 0 then
+				-- clearing a camp unlocks its 2 rescue wagons: prefer the one that's done soonest
+				-- (flight ~120 studs/s, ~4s per bandit), skip camps with hostile players around
+				local mp = m:GetPivot().Position
+				local d = (mp - r.Position).Magnitude / 120 + m:GetAttribute("EnemiesLeft") * 4
+				if m.Name == "CowboyTest" then d -= 12 end -- Imperial camp: its wagons are the red chests
+				if #W.threats(clear, mp) == 0 and (not bd or d < bd) then best, bd = m, d end
+			end
 		end
+		if best then return best end
 	end
-	return best
 end
 
 -------------------------------------------------------------------------------
@@ -1192,6 +1354,37 @@ function W.clearBounty()
 	return true
 end
 
+-- heartbeat for the PC-side watchdog (ww_watchdog.sh): time + "disconnected" flag. A kicked /
+-- disconnected client (error 277) looks alive to the bridge but nothing replicates any more.
+local GuiService = game:GetService("GuiService")
+spawnLoop("heartbeat", function()
+	local dc = false
+	pcall(function() dc = GuiService:GetErrorMessage() ~= "" end)
+	pcall(writefile, "ww_hb.txt", string.format("%d %s %d %s", os.time(), dc and "DC" or "OK", money(), tostring(W.status)))
+	task.wait(5)
+end)
+
+-- what raises the bounty / restarts the 40s clear countdown? log it with what we were doing
+W.bountyLog = {}
+do
+	local lastB, lastTick = lp:GetAttribute("Bounty"), lp:GetAttribute("RogueTurnOffTick")
+	local function note(what)
+		table.insert(W.bountyLog, 1, string.format("[%s] %s | %s tgt=%s", os.date("%H:%M:%S"), what, tostring(W.status), W.target and W.target.Name or "-"))
+		if #W.bountyLog > 40 then table.remove(W.bountyLog) end
+	end
+	conn(lp:GetAttributeChangedSignal("Bounty"), function()
+		local b = lp:GetAttribute("Bounty")
+		note(string.format("bounty %s -> %s", tostring(lastB), tostring(b)))
+		lastB = b
+	end)
+	conn(lp:GetAttributeChangedSignal("RogueTurnOffTick"), function()
+		local t = lp:GetAttribute("RogueTurnOffTick")
+		if t == nil or lastTick == nil or t > lastTick then note(string.format("clear tick %s -> %s", tostring(lastTick), tostring(t))) end
+		lastTick = t
+	end)
+	conn(lp:GetAttributeChangedSignal("Rogue"), function() note("Rogue=" .. tostring(lp:GetAttribute("Rogue"))) end)
+end
+
 -- radar: the server broadcasts every player's position at 2 Hz (MapEvent feeds the
 -- spellbook map), so players outside the ~420 stud streaming radius are still known
 W.radar = {}
@@ -1207,9 +1400,14 @@ local function posOf(pl)
 	if e and os.clock() - e.t < 3 then return e.p, e.t end
 end
 W.posOf = posOf
+-- hunters: players who hit us or came right at us while we were wanted. They stay dangerous for
+-- 10 minutes whatever their rogue status (bounty hunters camp the artifact/wanted players).
+W.hunters = {}
+local function isHunter(pl) return W.hunters[pl.Name] and os.clock() - W.hunters[pl.Name] < 600 end
+W.isHunter = isHunter
 local function hostilePl(pl, wanted)
 	local m = pl.Character
-	return wanted or pl:GetAttribute("Rogue") or (m and m:GetAttribute("Rogued")) or (pl:GetAttribute("Bounty") or 0) > 0
+	return wanted or isHunter(pl) or pl:GetAttribute("Rogue") or (m and m:GetAttribute("Rogued")) or (pl:GetAttribute("Bounty") or 0) > 0
 end
 -- rogues can hit anyone; while we are wanted anyone can hit us. `from` defaults to us.
 function W.threats(radius, from)
@@ -1241,7 +1439,8 @@ function W.realThreats()
 		local tr = pl and W.track[pl]
 		local approaching = tr and tr.closing and tr.closing > 12
 		local attacker = pl and W.attackers[pl] and os.clock() < W.attackers[pl]
-		if t.d < 60 or approaching or attacker then out[#out + 1] = t end
+		-- a rogue 147 studs away one-shot 106 HP off us: anyone within 160 is too close
+		if t.d < 160 or approaching or attacker then out[#out + 1] = t end
 	end
 	return out
 end
@@ -1290,6 +1489,7 @@ spawnLoop("safety", function()
 	if not h then lastHp = nil return end
 	-- took damage while a hostile player is around -> danger
 	if lastHp and h.Health < lastHp - 1 then
+		W.lastDamageT = os.clock()
 		-- who hit us? nearest hostile player unless a bandit is right next to us
 		local near = W.threats(160)
 		local aiClose = false
@@ -1299,11 +1499,14 @@ spawnLoop("safety", function()
 		end
 		if #near > 0 and (not aiClose or near[1].d < 50) then
 			local pl = Players:GetPlayerFromCharacter(near[1].m)
-			if pl then W.attackers[pl] = os.clock() + 25 end
+			if pl then W.attackers[pl] = os.clock() + 25 W.hunters[pl.Name] = os.clock() end
 			W.dangerUntil = os.clock() + 20
 		end
 	end
 	lastHp = h.Health
+	if W.iAmWanted() then
+		for _, t in ipairs(W.threats(40)) do W.hunters[t.pl.Name] = os.clock() end
+	end
 	-- last ~8s of hp/position/status for the death log
 	local r0 = hrp()
 	-- void rescue: remember the last spot with ground under us; falling far below it -> back up
@@ -1373,7 +1576,7 @@ function W.productiveSpot(danger, minAway)
 	local function consider(pos, value, land)
 		if not pos then return end
 		if danger and Vector3.new(pos.X - danger.X, 0, pos.Z - danger.Z).Magnitude < minAway then return end
-		if #W.threats(400, pos) > 0 then return end
+		if #W.threats(cfg.workClear, pos) > 0 then return end
 		if not bs or value > bs then best, bs = land or pos, value end
 	end
 	if cfg.wagonLoot then
@@ -1407,12 +1610,16 @@ function W.flee(reason)
 	local danger = (th[1] and th[1].p) or r.Position
 	local dest = W.productiveSpot(danger, 800)
 	status("FLEE: " .. reason .. (dest and " -> relocating" or ""))
+	W.broomOff()
 	local sp = apparateSpell()
 	local moved = false
+	-- Apparate is the fastest way out (gone in ~1.5s); the cloak (~0.5s cast) comes after it,
+	-- or first when we have to blink/fly away in sight of them
 	if cfg.useApparate and sp and h.Health > (sp:GetAttribute("HealthCost") or 50) + 15 and workspace:GetServerTimeNow() >= (sp:GetAttribute("CooldownExpire") or 0) then
 		moved = W.apparate(dest or W.safeSpot(900, 3500), true)
 		if moved then W.stats.relocations = (W.stats.relocations or 0) + 1 end
 	end
+	W.setCloak(true)
 	if not moved then
 		W.blinkBurst(W.awayPoint(r.Position, danger, 700), nil)
 		if dest and (dest - hrp().Position).Magnitude < 1500 then
@@ -1463,6 +1670,10 @@ local function artifactOk(site)
 	local h = hum()
 	if not h or h.Health / h.MaxHealth < 0.8 then return false, "low hp" end
 	if #W.threats(700, site) > 0 then return false, "players near" end
+	for _, pl in ipairs(Players:GetPlayers()) do
+		local p = isHunter(pl) and posOf(pl)
+		if p and (p - site).Magnitude < 1800 then return false, pl.Name .. " hunts us" end
+	end
 	if cfg.heistNeedApparate and not apparateReady() then return false, "apparate on cooldown" end
 	return true
 end
@@ -1543,12 +1754,14 @@ function W.grabNoble(p)
 	if #near > 0 then status("noble artifact: " .. near[1].pl.Name .. " is near it") return false end
 	status("noble artifact: " .. m.Name)
 	W.noApparate = true
-	W.travel(pos + Vector3.new(0, 1, 0), 0, true)
+	if roofed(pos) then W.walkIn(pos + Vector3.new(0, 1, 0)) else W.travel(pos + Vector3.new(0, 1, 0), 0, true) end
 	W.noApparate = false
 	if not p.Parent then return false end
 	local before = {}
 	for _, t in ipairs(lp.Backpack:GetChildren()) do before[t] = true end
 	W.hoverPos = pos + Vector3.new(0, 1.5, 0)
+	W.broomOff()
+	W.setCloak(false)
 	fireproximityprompt(p)
 	task.wait(p.HoldDuration + 2)
 	W.hoverPos = nil
@@ -1650,6 +1863,7 @@ spawnLoop("farm", function()
 			local gy = groundY(r.Position.X, r.Position.Z)
 			W.hoverPos = Vector3.new(r.Position.X, (gy or r.Position.Y) + 3, r.Position.Z)
 		end
+		W.setCloak(true)
 		local tick = lp:GetAttribute("RogueTurnOffTick")
 		status(string.format("wanted ($%d) - laying low%s", lp:GetAttribute("Bounty") or 0, tick and (", clears in " .. tick .. "s") or ""))
 		task.wait(1)
@@ -1665,7 +1879,7 @@ spawnLoop("farm", function()
 		local best, bd
 		for _, p in ipairs(W.wagonTargets()) do
 			local pp = mdlPos(p.Parent)
-			if pp and #W.threats(150, pp) == 0 then
+			if pp and #W.threats(cfg.workClear, pp) == 0 then
 				-- red chests are worth a detour: rank by distance / 3
 				local d = (pp - r.Position).Magnitude / (chestKind(p) == "red" and 3 or 1)
 				if not bd or d < bd then best, bd = p, d end
@@ -1673,7 +1887,7 @@ spawnLoop("farm", function()
 		end
 		if best then status(string.format("%s (%dm)", lootName(best), (mdlPos(best.Parent) - r.Position).Magnitude)) W.openPrompt(best) return end
 	end
-	if cfg.bossFarm then
+	if cfg.bossFarm and not W.iAmWanted() then
 		local m = W.missionTarget()
 		if m then
 			W.farming = true
@@ -1735,8 +1949,10 @@ spawnLoop("combat", function()
 	end
 	if cfg.autoHeal then W.healStep() end
 	-- no offensive casts mid-trip: CastingSpell blocks dash-blinks and casting knocks us off the broom
-	if W.inTrip then return end
+	if W.inTrip or W.heistActive or W.holdingArtifact then return end -- stay cloaked, no side fights
 	W.armorStep()
+	-- wanted: every bandit kill adds +25 bounty (measured) -> hold fire until the bounty is cleared
+	if W.iAmWanted() then return end
 	if W.target and (cfg.autoFire or cfg.autoSpells or cfg.bossFarm) then
 		if cfg.bossFarm and W.farming then
 			local a, b = cfg.autoFire, cfg.autoSpells
@@ -1777,6 +1993,7 @@ local origRagdolled = RagdollClient.HumanoidRagdolled
 RagdollClient.HumanoidRagdolled = function(h, on, died, ...)
 	if cfg.antiRagdoll and on and not died and h == hum() then
 		W.stats.ragdollsBlocked = (W.stats.ragdollsBlocked or 0) + 1
+		W.lastRagdollT = os.clock()
 		h.PlatformStand = false
 		h:ChangeState(Enum.HumanoidStateType.GettingUp)
 		return
