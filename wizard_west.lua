@@ -41,7 +41,7 @@ local cfg = {
 	heistNeedApparate = true, -- only grab the artifact when Apparate is ready for the escape
 	wagonLoot = true,       -- open unlocked wagon loot while farming
 	bossFarm = false,       -- bandit mission farm (combat)
-	autoMine = false,       -- mine ore veins (needs Vocare Pickaxe)
+	autoMine = true,        -- gem trips to the Crystal Cave when they beat the camps (needs Vocare Pickaxe)
 	mineMinRate = 25,       -- $/s a gem trip must beat to leave the camps (4 gems up ~ $40/s)
 	autoContracts = true,
 	autoHop = true,
@@ -1234,7 +1234,7 @@ function W.veinStand(v, vp, floorOnly)
 end
 -- best vein by value per second (like the wagons). A trip into the cave (~15s walk-in) pays for
 -- every gem that's up, so gems are rated as a group until we're inside.
-function W.mineTarget(coalToo)
+function W.mineTarget(coalToo, rockBonus)
 	local r = hrp()
 	if not r then return end
 	local inCave = W.inCave()
@@ -1249,13 +1249,13 @@ function W.mineTarget(coalToo)
 			local p = v:GetPivot().Position
 			local d = (p - r.Position).Magnitude
 			-- coal ($100) only when it's close: a 2700-stud trip for it lost money on time
-			if p.Magnitude > 5 and (gem or d < 500) and #W.threats(cfg.workClear, p) == 0 then
+			if p.Magnitude > 5 and (gem or d < 500 or rockBonus) and #W.threats(cfg.workClear, p) == 0 then
 				local rate
 				if gem and not inCave then
 					-- measured: ~10s to land in the ravine + walk, ~10s per gem (walk, spiders, ~5s mining)
 					rate = gemsUp * GEM_VALUE / (d / 100 + 20 + gemsUp * 10)
 				else
-					rate = (gem and GEM_VALUE or COAL_VALUE) / (d / 100 + 8)
+					rate = ((gem and GEM_VALUE or COAL_VALUE) + (rockBonus or 0)) / (d / 100 + 8)
 				end
 				if not bd or rate > bd then best, bd = v, rate end
 			end
@@ -1277,9 +1277,16 @@ function W.mineVein(v)
 			-- straight down from high above: a slanted landing crosses webs/rock and gets yanked back up
 			W.travel(W.CAVE_ENTRY + Vector3.new(0, 110, 0), 0, true)
 			if (Vector3.new(hrp().Position.X, 0, hrp().Position.Z) - Vector3.new(W.CAVE_ENTRY.X, 0, W.CAVE_ENTRY.Z)).Magnitude > 20 then return false end
-			W.broomOff()
-			W.glide(W.CAVE_ENTRY, 30)
-			if (hrp().Position - W.CAVE_ENTRY).Magnitude > 12 then W.log[#W.log + 1] = "mine: descent failed" return false end
+			-- the server sometimes rolls the descent back (we "land", then snap back up ~100): check
+			-- after a moment and go again; the last stretch slower
+			for _ = 1, 2 do
+				W.broomOff()
+				W.glide(W.CAVE_ENTRY + Vector3.new(0, 20, 0), 30)
+				W.glide(W.CAVE_ENTRY, 15)
+				task.wait(0.6)
+				if (hrp().Position - W.CAVE_ENTRY).Magnitude < 12 then break end
+			end
+			if (hrp().Position - W.CAVE_ENTRY).Magnitude > 12 then W.log[#W.log + 1] = "mine: descent rolled back" return false end
 		end
 		W.broomOff()
 		stand = W.veinStand(v, vp) -- from where we landed
@@ -1353,6 +1360,15 @@ function W.mineVein(v)
 end
 
 -- contracts / skill tree / equip
+-- open contract task the farm can steer toward. The Common contract refreshes 5 min after a claim
+-- and pays ~$975 on average (Gold 500 / Diamond / 2 Gold Goblets); seen tasks: MineRocks (4),
+-- HitFire (8 fire-spell hits). Daily: HitFire 25.
+function W.contractWants(id)
+	for _, c in ipairs(Concept.Contracts:GetChildren()) do
+		if c:GetAttribute("Id") == id and not c:GetAttribute("Completed") and (c:GetAttribute("Value") or 0) < (c:GetAttribute("Goal") or 0) then return true end
+	end
+	return false
+end
 W.contractTry = {}
 function W.claimContracts()
 	for _, c in ipairs(Concept.Contracts:GetChildren()) do
@@ -1435,11 +1451,13 @@ function W.desiredLoadout()
 				score = statSum(it) * 10 + (d.Rarity or 0)
 			elseif cat == "Utility Spells" then
 				score = UTIL_PRIO[it.Name] or 10
-				if it.Name == "Vocare Pickaxe" then score = cfg.autoMine and 90 or 3 end
+				if it.Name == "Vocare Pickaxe" then score = (cfg.autoMine or W.contractWants("MineRocks")) and 90 or 3 end
 			elseif cat == "Spells" or cat == "Wild Magic" then
 				score = (d.Rarity or 1) * 10
 				if it == bestHeal then score += 25 elseif isHealName(it.Name) then score -= 15 end
 				score += SPELL_ADJ[it.Name] or 0
+				-- fire-hit contract open: carry the fire cone until it's done
+				if it.Name == "Ignisio" and W.contractWants("HitFire") then score += 60 end
 			end
 			if score then
 				byCat[cat] = byCat[cat] or {}
@@ -2353,9 +2371,11 @@ W.farmFn = function()
 	end
 	-- gem veins: ~4 x $710 every ~90s in the Crystal Cave; worth a detour when the rate beats the camps
 	W.br = "mine"
-	if cfg.autoMine and not W.iAmWanted() then
-		local v, rate = W.mineTarget(false)
-		if v and (W.inCave() or rate >= cfg.mineMinRate or not cfg.bossFarm) then W.mineVein(v) return end
+	local rocks = W.contractWants("MineRocks")
+	if (cfg.autoMine or rocks) and not W.iAmWanted() and farmingAny then
+		-- a MineRocks contract adds its reward share (~$975 / 4 rocks) to every vein, coal too
+		local v, rate = W.mineTarget(rocks, rocks and 240 or nil)
+		if v and (W.inCave() or rate >= cfg.mineMinRate * (rocks and 0.5 or 1) or not cfg.bossFarm) then W.mineVein(v) return end
 	end
 	W.br = "wagons"
 	if cfg.wagonLoot and farmingAny then
