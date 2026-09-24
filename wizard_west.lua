@@ -41,7 +41,9 @@ local cfg = {
 	avoidPlayers = true,    -- flee from dangerous players
 	dangerRadius = 130,     -- a dangerous player this close -> leave
 	fleeHp = 45,            -- HP% at which farming stops and we retreat
-	layLow = true,          -- while wanted (bounty), hide far from players until it clears
+	layLow = true,
+	autoClearBounty = true, -- RogueEvent: bounty + rogue status wiped after a 40s countdown
+	fightBack = true,       -- silent-aim + spells on players who attack us          -- while wanted (bounty), hide far from players until it clears
 	autoBuy = false,        -- buy next skill-tree item automatically
 	buyOrder = { "ChMiner", "ChWayfarer", "ChCadet", "ChWater", "ChSnatcher", "ChFrost", "ChBlade", "ChFire", "ChMusket", "ChMoL", "ChStorm", "ChIronblood", "ChOcean", "ChVampire", "ChWukong", "ChMind", "ChDeath" },
 	keepMoney = 0,          -- never spend below this
@@ -171,6 +173,7 @@ function W.broomOn()
 		if f:GetAttribute("FlightModel") then b = f break end
 	end
 	if not (b and b:FindFirstChild("ToolListnerEvent")) then return false end
+	if workspace:GetServerTimeNow() < (b:GetAttribute("CooldownExpire") or 0) then return false end
 	local h = hum()
 	if h then h:ChangeState(Enum.HumanoidStateType.Jumping) end
 	task.wait(0.2)
@@ -224,7 +227,8 @@ function W.glide(goal, speed, token)
 		local jet = char() and char():GetAttribute("JetPacking")
 		if not jet then
 			if speed > cfg.travelSpeed then speed = cfg.travelSpeed end
-			if cfg.broomTravel and not cfg.underground and os.clock() - (W.lastBroomTry or 0) > 2 then
+			if W.inTrip and cfg.broomTravel and not cfg.underground and (W.tripBroomTries or 0) < 3 and os.clock() - (W.lastBroomTry or 0) > 3 then
+				W.tripBroomTries = (W.tripBroomTries or 0) + 1
 				W.lastBroomTry = os.clock()
 				task.spawn(W.broomOn)
 			end
@@ -258,13 +262,14 @@ local function apparateSpell()
 	return w and w.Spells:FindFirstChild("Royal Apparate") or (w and w.Spells:FindFirstChild("Apparate")), w
 end
 
-function W.apparate(goal)
+function W.apparate(goal, escaping)
 	local sp, w = apparateSpell()
 	local c, h = char(), hum()
 	if not (sp and c and h) then return false end
 	if workspace:GetServerTimeNow() < (sp:GetAttribute("CooldownExpire") or 0) then return false end
 	-- keep enough HP after the cost so we don't trip the low-HP retreat
-	if (h.Health - (sp:GetAttribute("HealthCost") or 50)) / h.MaxHealth * 100 <= math.max(cfg.fleeHp, 10) then return false end
+	if not escaping and (h.Health - (sp:GetAttribute("HealthCost") or 50)) / h.MaxHealth * 100 <= math.max(cfg.fleeHp, 10) then return false end
+	if h.Health <= (sp:GetAttribute("HealthCost") or 50) + 1 then return false end
 	if (c:GetAttribute("DashStamina") or 0) < (sp:GetAttribute("StamCost") or 33) then return false end
 	W.hoverPos = nil
 	equip(w)
@@ -282,6 +287,14 @@ end
 -- go to a world position; lands `above` studs over the ground there
 -- (exact=true: end exactly at goal, e.g. inside buildings)
 function W.travel(goal, above, exact)
+	W.inTrip = true
+	W.tripBroomTries = 0
+	local ok, res = pcall(W._travel, goal, above, exact)
+	W.inTrip = false
+	if not ok then W.log[#W.log + 1] = "travel: " .. tostring(res) return false end
+	return res
+end
+function W._travel(goal, above, exact)
 	W.travelToken += 1
 	local token = W.travelToken
 	local r = hrp()
@@ -291,7 +304,8 @@ function W.travel(goal, above, exact)
 	local gy = groundY(goal.X, goal.Z)
 	local target = exact and goal or Vector3.new(goal.X, math.max(goal.Y, (gy or goal.Y)) + above, goal.Z)
 	local dist = (Vector3.new(target.X, 0, target.Z) - Vector3.new(r.Position.X, 0, r.Position.Z)).Magnitude
-	if cfg.useApparate and dist > cfg.apparateMin and W.apparate(target) then
+	-- never Apparate into company: it costs half our HP
+	if cfg.useApparate and not W.noApparate and dist > cfg.apparateMin and #W.threats(350, target) == 0 and W.apparate(target) then
 		r = hrp()
 		dist = (target - r.Position).Magnitude
 	end
@@ -394,62 +408,106 @@ conn(Concept.Currencies.Money.Changed, function(v)
 	lastMoney = v
 end)
 
+-- only what trinket sellers take (SellTo/TrinketSell); soulbound items are skipped
+-- exactly what the game's GetTrinketValue counts (soulbound ones sell too)
+local function sellable(t)
+	return t:IsA("Tool") and t:GetAttribute("SellValue") ~= nil
+end
 local function trinkets()
 	local n, v = 0, 0
-	for _, t in ipairs(lp.Backpack:GetChildren()) do
-		if t:IsA("Tool") and t:GetAttribute("SellValue") then
-			local s = t:GetAttribute("Stacks") or 1
-			n += s v += t:GetAttribute("SellValue") * s
-		end
-	end
 	local c = char()
-	for _, t in ipairs((c and c:GetChildren()) or {}) do
-		if t:IsA("Tool") and t:GetAttribute("SellValue") then n += 1 v += t:GetAttribute("SellValue") end
+	for _, holder in ipairs({ lp.Backpack, c }) do
+		for _, t in ipairs((holder and holder:GetChildren()) or {}) do
+			if sellable(t) then
+				local st = t:GetAttribute("Stacks") or 1
+				n += st v += t:GetAttribute("SellValue") * st
+			end
+		end
 	end
 	return n, v
 end
 W.trinkets = trinkets
 
--- is the seller we'd use free of other players? (while wanted everyone can hit us)
-function W.sellerClear()
-	local p = W.wanted_seller and W.wanted_seller() or SELLERS[2]
-	for _, pl in ipairs(Players:GetPlayers()) do
-		local m = pl.Character
-		if pl ~= lp and m and m.PrimaryPart and (m.PrimaryPart.Position - p).Magnitude < 150 then return false end
+-- Selling = TrinketSellEvent:FireServer(<DialogConfig>). The game's client fires it once when you
+-- step into the zone (and never again until you leave, hence "needs several tries").
+-- Measured: the server takes it from anywhere within ~20-25 studs of the seller part
+-- (20 ok, 30 rejected), no zone needed. Streaming a seller in from afar does NOT help.
+-- So: fly straight at the seller and fire exactly once as soon as we're in range.
+local SELL_RANGE = 19
+W.sellCfgs = {}
+local function noteCfg(v) if v:GetAttribute("DialogType") == "SellTrinkets" then W.sellCfgs[v] = true end end
+for _, v in ipairs(CS:GetTagged("DialogConfig")) do noteCfg(v) end
+conn(CS:GetInstanceAddedSignal("DialogConfig"), noteCfg)
+local function sellCfgInRange()
+	local r = hrp()
+	if not r then return end
+	for v in pairs(W.sellCfgs) do
+		if v.Parent and v.Parent:IsA("BasePart") and v:IsDescendantOf(workspace) then
+			if (v.Parent.Position - r.Position).Magnitude <= SELL_RANGE then return v end
+		else
+			W.sellCfgs[v] = nil
+		end
 	end
-	return true
+end
+function W.trySellRemote(v)
+	local n0 = trinkets()
+	if n0 == 0 then return true end
+	local m0 = money()
+	Events.TrinketSellEvent:FireServer(v)
+	local t0 = os.clock()
+	repeat task.wait(0.05) until trinkets() < n0 or os.clock() - t0 > 1.5
+	if trinkets() < n0 then
+		W.stats.sells = (W.stats.sells or 0) + 1
+		W.stats.lastSell = string.format("%d items +$%d at %s", n0, money() - m0, v.Parent.Parent.Name)
+		return true
+	end
+	return false
 end
 
--- selling happens automatically (client Dialog loop) once you stand inside a
--- DialogConfig part; we just go there and step into it.
-function W.sellTrinkets()
-	local n = trinkets()
-	if n == 0 then return end
+-- nearest seller we may use: Royal Keep only for nobles, Police not while wanted,
+-- none with a hostile player (radar) near it
+function W.pickSeller()
 	local r = hrp()
+	if not r then return end
 	local best, bd
 	for i, p in ipairs(SELLERS) do
-		if i == 3 and not lp:GetAttribute("Noble") then continue end -- Royal Keep pushes non-nobles out
-		if i == 1 and W.iAmWanted() then continue end -- police station while wanted = arrest
-		local d = (p - r.Position).Magnitude
-		if not bd or d < bd then best, bd = p, d end
-	end
-	status("selling " .. n .. " trinkets")
-	W.travel(best, 4)
-	local part
-	for _ = 1, 40 do
-		for _, v in ipairs(CS:GetTagged("DialogConfig")) do
-			if v.Parent and v.Parent:IsA("BasePart") and (v.Parent.Position - best).Magnitude < 80 then part = v.Parent end
+		local ok = not (i == 3 and not lp:GetAttribute("Noble")) and not (i == 1 and W.iAmWanted())
+		if ok and #W.threats(150, p) == 0 then
+			local d = (p - r.Position).Magnitude
+			if not bd or d < bd then best, bd = p, d end
 		end
-		if part then break end
-		task.wait(0.25)
 	end
-	if part then
-		W.glide(part.Position, cfg.travelSpeed)
-		W.hoverPos = part.Position
-		for _ = 1, 20 do if trinkets() == 0 then break end task.wait(0.25) end
-		W.hoverPos = nil
+	return best
+end
+
+function W.sellTrinkets()
+	local n, val = trinkets()
+	if n == 0 then return true end
+	local v = sellCfgInRange()
+	if v and W.trySellRemote(v) then return true end
+	local p = W.pickSeller()
+	if not p then status("sell: every seller has company") return false end
+	status(string.format("selling %d trinkets ($%d)", n, val))
+	-- fly at the seller part itself (glides pass through walls); fire the moment we're in range
+	local done, sold = false, false
+	task.spawn(function() W.travel(p, 0, true) done = true end)
+	local t0 = os.clock()
+	while not done and os.clock() - t0 < 120 do
+		v = sellCfgInRange()
+		if v then
+			W.stop()
+			sold = W.trySellRemote(v)
+			break
+		end
+		task.wait(0.05)
 	end
-	W.stats.sells = (W.stats.sells or 0) + 1
+	if not sold then
+		v = sellCfgInRange()
+		sold = v ~= nil and W.trySellRemote(v)
+	end
+	W.hoverPos = nil
+	if sold then W.broomOff() end
+	return sold or trinkets() == 0
 end
 
 local function prompts(filter)
@@ -475,15 +533,31 @@ function W.openPrompt(p)
 	local t = W.promptTries[p] or { n = 0, last = 0 }
 	t.n += 1 t.last = os.clock()
 	W.promptTries[p] = t
-	local pos = mdlPos(p.Parent)
-	if not pos then return false end
-	W.travel(pos + Vector3.new(0, 1, -3), 0, true)
-	W.hoverPos = hrp().Position
-	task.wait(0.2)
-	fireproximityprompt(p)
-	task.wait(0.4)
+	local holder = p.Parent
+	if not holder then return false end
+	local cf, size
+	if holder:IsA("Model") then cf, size = holder:GetBoundingBox() else cf, size = holder.CFrame, holder.Size end
+	-- the prompt needs line of sight: stand on the ground beside the loot, try each side
+	local sides = { cf.RightVector * (size.X / 2 + 3), -cf.RightVector * (size.X / 2 + 3), cf.LookVector * (size.Z / 2 + 3), -cf.LookVector * (size.Z / 2 + 3) }
+	local first = true
+	for _, off in ipairs(sides) do
+		local spot = cf.Position + off
+		local gy = groundY(spot.X, spot.Z)
+		if not gy or gy > cf.Position.Y + 6 then gy = cf.Position.Y - size.Y / 2 end -- under a roof: use the loot's floor
+		local stand = Vector3.new(spot.X, gy + 3, spot.Z)
+		if first then W.travel(stand, 0, true) first = false else W.glide(stand, 30) end
+		if not p.Parent then return false end
+		local r = hrp()
+		W.hoverPos = stand
+		if r then r.CFrame = CFrame.new(stand, Vector3.new(cf.Position.X, stand.Y, cf.Position.Z)) end
+		task.wait(0.3)
+		fireproximityprompt(p)
+		local t0 = os.clock()
+		repeat task.wait(0.2) until openedByMe(p) or not p.Parent or os.clock() - t0 > 1.2 + p.HoldDuration
+		if openedByMe(p) or not p.Parent then W.hoverPos = nil return true end
+	end
 	W.hoverPos = nil
-	return true
+	return false
 end
 
 -- artifact missions: 2 chests (bounty 200) + an Artifact on a pillar (bounty 1000).
@@ -498,6 +572,7 @@ end
 function W.wagonTargets()
 	return prompts(function(p)
 		if (p:GetAttribute("BountyGiver") or 0) > 0 and not cfg.artifactFarm then return false end -- would make us wanted
+		if p.ObjectText == "Animal" then return false end -- "Rescue Animal": measured, gives nothing
 		return p.Name == "LootGiver" and p:FindFirstAncestor("ArtifactMission") == nil and promptFree(p)
 	end)
 end
@@ -690,7 +765,9 @@ local function validTarget(m)
 	if not h or h.Health <= 0 or m:GetAttribute("KOed") or m:GetAttribute("G_Cloak") then return false end
 	local pl = Players:GetPlayerFromCharacter(m)
 	if pl then
-		if not cfg.aimPlayers or m:GetAttribute("Safezone") then return false end
+		if m:GetAttribute("Safezone") then return false end
+		if W.attackers and W.attackers[pl] and os.clock() < W.attackers[pl] then return true end -- always fight back
+		if not cfg.aimPlayers then return false end
 		if cfg.onlyWanted and not isWanted(pl, m) then return false end
 		return true
 	end
@@ -825,26 +902,108 @@ end
 function W.iAmWanted()
 	return (lp:GetAttribute("Bounty") or 0) > 0 or lp:GetAttribute("Rogue") == true or lp:GetAttribute("HasIllegalArtifact") == true
 end
--- rogues can hit anyone; while we are wanted anyone can hit us
-function W.threats(radius)
+-- RogueEvent (fired by the spellbook's Rogue tab) starts a 40s countdown (RogueTurnOffTick)
+-- that wipes bounty + rogue status. Only fire it while rogue, and never twice.
+function W.clearBounty()
+	if not cfg.autoClearBounty or not lp:GetAttribute("Rogue") then return false end
+	if lp:GetAttribute("RogueTurnOffTick") or lp:GetAttribute("HasIllegalArtifact") then return false end
+	if os.clock() - (W.lastClear or 0) < 6 then return false end
+	W.lastClear = os.clock()
+	Events.RogueEvent:FireServer()
+	W.stats.bountyClears = (W.stats.bountyClears or 0) + 1
+	return true
+end
+
+-- radar: the server broadcasts every player's position at 2 Hz (MapEvent feeds the
+-- spellbook map), so players outside the ~420 stud streaming radius are still known
+W.radar = {}
+conn(Events.MapEvent.OnClientEvent, function(t)
+	if type(t) ~= "table" then return end
+	local now = os.clock()
+	for name, p in pairs(t) do if typeof(p) == "Vector3" then W.radar[name] = { p = p, t = now } end end
+end)
+local function posOf(pl)
+	local m = pl.Character
+	if m and m.PrimaryPart then return m.PrimaryPart.Position, os.clock() end
+	local e = W.radar[pl.Name]
+	if e and os.clock() - e.t < 3 then return e.p, e.t end
+end
+W.posOf = posOf
+local function hostilePl(pl, wanted)
+	local m = pl.Character
+	return wanted or pl:GetAttribute("Rogue") or (m and m:GetAttribute("Rogued")) or (pl:GetAttribute("Bounty") or 0) > 0
+end
+-- rogues can hit anyone; while we are wanted anyone can hit us. `from` defaults to us.
+function W.threats(radius, from)
 	local r = hrp()
 	local out = {}
-	if not r then return out end
+	from = from or (r and r.Position)
+	if not from then return out end
 	local wanted = W.iAmWanted()
 	for _, pl in ipairs(Players:GetPlayers()) do
-		local m = pl.Character
-		if pl ~= lp and m and m.PrimaryPart then
-			local h = m:FindFirstChildOfClass("Humanoid")
-			if h and h.Health > 0 and not m:GetAttribute("KOed") then
-				local hostile = wanted or pl:GetAttribute("Rogue") or m:GetAttribute("Rogued") or (pl:GetAttribute("Bounty") or 0) > 0
-				local d = (m.PrimaryPart.Position - r.Position).Magnitude
-				if hostile and d <= radius then out[#out + 1] = { m = m, d = d, p = m.PrimaryPart.Position } end
-			end
+		local p = pl ~= lp and posOf(pl)
+		if p then
+			local m = pl.Character
+			local h = m and m:FindFirstChildOfClass("Humanoid")
+			local down = (h and m.PrimaryPart and h.Health <= 0) or (m and m:GetAttribute("KOed"))
+			local d = (p - from).Magnitude
+			if not down and d <= radius and hostilePl(pl, wanted) then out[#out + 1] = { m = m, pl = pl, d = d, p = p } end
 		end
 	end
 	table.sort(out, function(a, b) return a.d < b.d end)
 	return out
 end
+-- per-player tracking: approaching? attacked us?
+W.track = {}
+W.attackers = {}
+function W.realThreats()
+	local out = {}
+	for _, t in ipairs(W.threats(cfg.dangerRadius)) do
+		local pl = t.pl
+		local tr = pl and W.track[pl]
+		local approaching = tr and tr.closing and tr.closing > 12
+		local attacker = pl and W.attackers[pl] and os.clock() < W.attackers[pl]
+		if t.d < 60 or approaching or attacker then out[#out + 1] = t end
+	end
+	return out
+end
+spawnLoop("track", function()
+	task.wait(0.25)
+	local r = hrp()
+	if not r then return end
+	for _, pl in ipairs(Players:GetPlayers()) do
+		local p, stamp
+		if pl ~= lp then p, stamp = posOf(pl) end
+		if p then
+			local tr = W.track[pl] or {}
+			-- how fast is *their* movement pointed at us (our own travel doesn't count);
+			-- radar positions only change at 2 Hz, so use the sample's own timestamp
+			if tr.p and stamp > tr.t + 0.05 then
+				local v = (p - tr.p) / (stamp - tr.t)
+				local toMe = r.Position - p
+				local c = toMe.Magnitude > 1 and v:Dot(toMe.Unit) or 0
+				tr.closing = (tr.closing or 0) * 0.4 + c * 0.6
+			end
+			if not tr.t or stamp > tr.t + 0.05 then tr.p, tr.t = p, stamp end
+			tr.d = (p - r.Position).Magnitude
+			W.track[pl] = tr
+		end
+	end
+	for pl in pairs(W.track) do if not pl.Parent then W.track[pl] = nil end end
+end)
+function W.attackerTarget()
+	local r = hrp()
+	local best, bd
+	for pl, untilT in pairs(W.attackers) do
+		local m = pl.Character
+		if os.clock() < untilT and m and m.PrimaryPart and r then
+			local d = (m.PrimaryPart.Position - r.Position).Magnitude
+			if d < cfg.aimRange and (not bd or d < bd) then best, bd = m, d end
+		end
+	end
+	return best
+end
+
 W.dangerUntil = 0
 local lastHp
 spawnLoop("safety", function()
@@ -852,9 +1011,22 @@ spawnLoop("safety", function()
 	local h = hum()
 	if not h then lastHp = nil return end
 	-- took damage while a hostile player is around -> danger
-	if lastHp and h.Health < lastHp - 1 and #W.threats(300) > 0 then W.dangerUntil = os.clock() + 20 end
+	if lastHp and h.Health < lastHp - 1 then
+		-- who hit us? nearest hostile player unless a bandit is right next to us
+		local near = W.threats(160)
+		local aiClose = false
+		for _, hh in ipairs(CS:GetTagged("ActiveHumanoid")) do
+			local m = hh.Parent
+			if m and m:GetAttribute("IsAI") and hh.Health > 0 and hrp() and (m:GetPivot().Position - hrp().Position).Magnitude < 60 then aiClose = true break end
+		end
+		if #near > 0 and (not aiClose or near[1].d < 50) then
+			local pl = Players:GetPlayerFromCharacter(near[1].m)
+			if pl then W.attackers[pl] = os.clock() + 25 end
+			W.dangerUntil = os.clock() + 20
+		end
+	end
 	lastHp = h.Health
-	if cfg.avoidPlayers and #W.threats(W.heistActive and 45 or cfg.dangerRadius) > 0 then W.dangerUntil = math.max(W.dangerUntil, os.clock() + 8) end
+	if cfg.avoidPlayers and #(W.heistActive and W.threats(45) or W.realThreats()) > 0 then W.dangerUntil = math.max(W.dangerUntil, os.clock() + 8) end
 	local lowHp = h.Health / h.MaxHealth * 100 < cfg.fleeHp
 	local danger = cfg.avoidPlayers and (os.clock() < W.dangerUntil or lowHp)
 	if danger and not W.fleeing and (cfg.bossFarm or cfg.artifactFarm or cfg.autoMine) then
@@ -876,7 +1048,8 @@ function W.safeSpot(minFrom, maxFrom)
 	end
 	local others = {}
 	for _, pl in ipairs(Players:GetPlayers()) do
-		if pl ~= lp and pl.Character and pl.Character.PrimaryPart then others[#others + 1] = pl.Character.PrimaryPart.Position end
+		local p = pl ~= lp and posOf(pl)
+		if p then others[#others + 1] = p end
 	end
 	local camps = {}
 	for _, m in ipairs(workspace.Missions:GetChildren()) do if m:IsA("Model") then camps[#camps + 1] = m:GetPivot().Position end end
@@ -920,7 +1093,9 @@ function W.flee(reason)
 	r = hrp()
 	-- Apparate is instant, use it if it's off cooldown and we can afford the HP
 	local sp = apparateSpell()
-	if sp and (spot - r.Position).Magnitude > 300 and W.apparate(spot) then
+	local h0 = hum()
+	local canApp = sp and h0 and h0.Health > (sp:GetAttribute("HealthCost") or 50) + 2 and workspace:GetServerTimeNow() >= (sp:GetAttribute("CooldownExpire") or 0)
+	if canApp and (spot - r.Position).Magnitude > 300 and W.apparate(spot, true) then
 	else
 		W.travel(spot, 3)
 	end
@@ -930,7 +1105,7 @@ function W.flee(reason)
 	local t0 = os.clock()
 	while alive() and os.clock() - t0 < 90 do
 		local h = hum()
-		if #W.threats(cfg.dangerRadius + 80) > 0 then
+		if #W.realThreats() > 0 then
 			W.fleeing = false
 			return W.flee("followed")
 		end
@@ -960,24 +1135,19 @@ function W.heist()
 	if #targets == 0 then return false end
 	table.sort(targets, function(a, b) return (isArtifactPrompt(a) and 1 or 0) < (isArtifactPrompt(b) and 1 or 0) end)
 	local site = mdlPos(targets[1].Parent)
-	-- scout: someone hostile camping the loot?
-	for _, pl in ipairs(Players:GetPlayers()) do
-		local m = pl.Character
-		if pl ~= lp and m and m.PrimaryPart and (m.PrimaryPart.Position - site).Magnitude < cfg.heistClear then
-			if pl:GetAttribute("Rogue") or m:GetAttribute("Rogued") or (pl:GetAttribute("Bounty") or 0) > 0 then
-				status("heist: rogue " .. pl.Name .. " at the bank, waiting")
-				W.hoverPos = nil
-				return false
-			end
-		end
+	-- scout with the radar (map-wide): a rogue camping the loot kills looters on arrival
+	local camp = W.threats(cfg.heistClear, site)
+	if #camp > 0 then
+		status("heist: " .. camp[1].pl.Name .. " camping the bank, waiting")
+		return false
 	end
-	-- the artifact makes us the most wanted person on the server: only grab it with the escape ready
-	local wantArtifact = false
-	for _, p in ipairs(targets) do if isArtifactPrompt(p) then wantArtifact = true end end
 	W.heistActive = true
+	W.noApparate = true -- arrive with full HP; Apparate costs half of it
 	W.stats.heists = (W.stats.heists or 0) + 1
 	for _, p in ipairs(targets) do
 		if not alive() then break end
+		local camp2 = W.threats(cfg.heistClear, site)
+		if #camp2 > 0 then status("heist: " .. camp2[1].pl.Name .. " showed up, abort") break end
 		if isArtifactPrompt(p) then
 			if not apparateReady() and cfg.heistNeedApparate then
 				status("heist: waiting for Apparate before the artifact")
@@ -998,6 +1168,7 @@ function W.heist()
 		end
 	end
 	W.heistActive = false
+	W.noApparate = false
 	return true
 end
 
@@ -1006,7 +1177,10 @@ W.deaths = {}
 local function hookDeath(c)
 	local h = c:WaitForChild("Humanoid", 10)
 	if not h then return end
-	h.Died:Connect(function()
+	local logged = false
+	conn(h.Died, function()
+		if logged then return end -- Died fires more than once here
+		logged = true
 		local thf = {}
 		for k, v in pairs(c:GetAttributes()) do
 			if k:sub(1, 4) == "THF_" then thf[#thf + 1] = k:sub(5) .. "@" .. string.format("%.1f", v) end
@@ -1022,10 +1196,14 @@ local function hookDeath(c)
 		local e = string.format("[%s] died at %s while '%s' | hit by: %s (gt %.1f) | near: %s | bounty %s",
 			os.date("%H:%M:%S"), r and tostring(Vector3.new(math.floor(r.Position.X), math.floor(r.Position.Y), math.floor(r.Position.Z))) or "?",
 			tostring(W.status), table.concat(thf, ", "), workspace.DistributedGameTime, table.concat(near, ", "), tostring(lp:GetAttribute("Bounty")))
+		local att = {}
+		for pl, t in pairs(W.attackers) do if os.clock() < t then att[#att + 1] = pl.Name end end
+		e = e .. " | attackers: " .. table.concat(att, ",")
 		W.deaths[#W.deaths + 1] = e
 		pcall(appendfile, "ww_deaths.txt", e .. "\n")
 		W.hoverPos = nil
 		W.heistActive = false
+		W.noApparate = false
 	end)
 end
 if lp.Character then task.spawn(hookDeath, lp.Character) end
@@ -1049,8 +1227,10 @@ spawnLoop("farm", function()
 	end
 	if lp.Backpack:FindFirstChild("Artifact") or (char() and char():FindFirstChild("Artifact")) then waitArtifact() return end
 	-- wanted: sell loot if the seller is clear, otherwise hide until the bounty clears
+	if W.iAmWanted() then W.clearBounty() end
 	if W.iAmWanted() and (farmingAny) and cfg.layLow then
-		if cfg.autoSell and trinkets() > 0 and W.sellerClear() then W.sellTrinkets() return end
+		-- sell right away unless the bounty clears soon anyway (then every seller incl. police is fine)
+		if cfg.autoSell and trinkets() > 0 and not lp:GetAttribute("RogueTurnOffTick") and W.pickSeller() then W.sellTrinkets() return end
 		local spot = W.hoverPos
 		if not spot or #W.threats(400) > 0 then
 			W.hoverPos = nil
@@ -1060,7 +1240,8 @@ spawnLoop("farm", function()
 			local gy = groundY(r.Position.X, r.Position.Z)
 			W.hoverPos = Vector3.new(r.Position.X, (gy or r.Position.Y) + 3, r.Position.Z)
 		end
-		status(string.format("wanted ($%d) - laying low", lp:GetAttribute("Bounty") or 0))
+		local tick = lp:GetAttribute("RogueTurnOffTick")
+		status(string.format("wanted ($%d) - laying low%s", lp:GetAttribute("Bounty") or 0, tick and (", clears in " .. tick .. "s") or ""))
 		task.wait(1)
 		return
 	end
@@ -1124,7 +1305,15 @@ spawnLoop("combat", function()
 	task.wait(0.12)
 	if not alive() then return end
 	local need = cfg.silentAim or cfg.autoFire or cfg.autoSpells or cfg.bossFarm
-	W.target = need and W.findTarget((cfg.bossFarm and W.farming) and 260 or nil) or nil
+	local attacker = cfg.fightBack and W.attackerTarget()
+	W.target = attacker or (need and W.findTarget((cfg.bossFarm and W.farming) and 260 or nil)) or nil
+	if attacker then
+		local a, b = cfg.autoFire, cfg.autoSpells
+		cfg.autoFire, cfg.autoSpells = true, true
+		W.attackStep()
+		cfg.autoFire, cfg.autoSpells = a, b
+		return
+	end
 	if cfg.autoHeal then W.healStep() end
 	if W.target and (cfg.autoFire or cfg.autoSpells or cfg.bossFarm) then
 		if cfg.bossFarm and W.farming then
@@ -1358,6 +1547,8 @@ toggle(pF, "Flee from dangerous players", "avoidPlayers")
 number(pF, "Danger radius", "dangerRadius", 10, 40, 400)
 number(pF, "Retreat below HP %", "fleeHp", 5, 10, 90)
 toggle(pF, "Lay low while wanted (bounty)", "layLow")
+toggle(pF, "Auto clear bounty (40s countdown)", "autoClearBounty")
+toggle(pF, "Fight back against attackers", "fightBack")
 header(pF, "progress")
 toggle(pF, "Auto claim contracts", "autoContracts")
 toggle(pF, "Auto buy skill tree (order in cfg.buyOrder)", "autoBuy")
