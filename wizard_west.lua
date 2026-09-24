@@ -59,7 +59,7 @@ local cfg = {
 	flyHeight = 22,         -- broom cruise height above ground/roofs
 	undergroundDepth = 14,
 	fightDistance = 24,     -- bandit farm: stand on the ground this far from the target
-	blinkTravel = true,     -- start trips with a burst of 95-stud dash-blinks (~230 studs/s)
+	blinkTravel = false,    -- start trips with dash-blinks. OFF: the broom leg after a burst gets rolled back (30-55/s vs 120 clean)
 	dismountOnArrive = true, -- get off the broom on arrival so dash stamina refills      -- keep this much dash stamina for emergencies
 	useApparate = true,     -- use Apparate spell for trips > apparateMin studs
 	apparateMin = 900,
@@ -127,6 +127,13 @@ local function spawnLoop(name, f)
 	return t
 end
 local function status(s) W.status = s if W.statusLabel then W.statusLabel.Text = s end end
+-- appendfile errors on a missing file (executor quirk): create it first
+local function logf(file, line)
+	pcall(function()
+		if isfile(file) then appendfile(file, line) else writefile(file, line) end
+	end)
+end
+W.logf = logf
 local function mdlPos(m)
 	if not m then return nil end
 	if m:IsA("BasePart") then return m.Position end
@@ -153,6 +160,62 @@ local function groundY(x, z)
 	rayP.FilterDescendantsInstances = { workspace.Characters, workspace.Entities, workspace.Particles }
 	local r = workspace:Raycast(Vector3.new(x, 1500, z), Vector3.new(0, -3000, 0), rayP)
 	return r and r.Position.Y
+end
+
+-- Land mask from the game's own minimap (run-length rows, 'Z' = void). Raycasts only see the
+-- streamed-in area, this covers the whole map. Twice an artifact escape "safe spot" was over the
+-- void: hovering held us up, the next trip dropped us to our death with the Diamond.
+local LAND = {}
+pcall(function()
+	local gen = RepS.Modules.Client.SpellBook.Catagories.Map.ClientMapGenerator
+	local dims = require(gen.MapDimensions)
+	local data = require(gen:FindFirstChild("MinimapModule_" .. game.PlaceId))
+	local i = 0
+	for row in string.gmatch(data, "[^|]+") do
+		i += 1
+		local runs, c = {}, 0
+		for ch, n in string.gmatch(row, "(%a)(%d+)") do
+			n = tonumber(n)
+			if ch ~= "Z" then runs[#runs + 1] = { c, c + n - 1 } end
+			c += n
+		end
+		LAND[i] = runs
+	end
+	-- world -> minimap (rotation 90): row = X axis, column = Z axis
+	LAND.n, LAND.half, LAND.ox, LAND.oz = i, dims.X.Max, dims.Offset.X, dims.Offset.Y
+end)
+local function landAt(x, z)
+	local n = LAND.n
+	local runs = LAND[math.floor(n * (x - LAND.ox + LAND.half) / (2 * LAND.half))]
+	if not runs then return false end
+	local c = math.floor(n * (z - LAND.oz + LAND.half) / (2 * LAND.half))
+	for _, rr in ipairs(runs) do if c >= rr[1] and c <= rr[2] then return true end end
+	return false
+end
+-- land here and `margin` studs around it
+function W.isLand(x, z, margin)
+	if not LAND.n then return true end -- no map data: never block
+	if not landAt(x, z) then return false end
+	margin = margin or 0
+	if margin > 0 then
+		for _, o in ipairs({ { margin, 0 }, { -margin, 0 }, { 0, margin }, { 0, -margin } }) do
+			if not landAt(x + o[1], z + o[2]) then return false end
+		end
+	end
+	return true
+end
+-- a point `dist` studs from `from`, heading away from `danger`, turned until it's over land
+function W.awayPoint(from, danger, dist)
+	local away = Vector3.new(from.X - danger.X, 0, from.Z - danger.Z)
+	if away.Magnitude < 1 then away = Vector3.new(1, 0, 0) end
+	away = away.Unit
+	for _, deg in ipairs({ 0, 30, -30, 60, -60, 90, -90, 120, -120 }) do
+		local a = math.rad(deg)
+		local dir = Vector3.new(away.X * math.cos(a) - away.Z * math.sin(a), 0, away.X * math.sin(a) + away.Z * math.cos(a))
+		local p = from + dir * dist
+		if W.isLand(p.X, p.Z, 60) then return p end
+	end
+	return from
 end
 
 -------------------------------------------------------------------------------
@@ -237,6 +300,9 @@ end
 -- hop toward goal (ground level) until the budget is used, we're close, or the server pulls one back
 function W.blinkBurst(goal, maxN, token)
 	local n = 0
+	-- a spell cast in progress blocks blinks: give it a moment to finish
+	local tw = os.clock()
+	while char() and char():GetAttribute("CastingSpell") and os.clock() - tw < 1.2 do task.wait(0.05) end
 	local budget = math.min(maxN or BURST_MAX, W.burstBudget())
 	local last = hrp() and hrp().Position
 	while n < budget and last do
@@ -437,8 +503,15 @@ end
 function W.travel(goal, above, exact)
 	W.inTrip = true
 	W.tripBroomTries = 0
+	local r0 = hrp()
+	local t0, d0 = os.clock(), r0 and (Vector3.new(goal.X, 0, goal.Z) - Vector3.new(r0.Position.X, 0, r0.Position.Z)).Magnitude or 0
+	W.tripInfo = {}
 	local ok, res = pcall(W._travel, goal, above, exact)
 	W.inTrip = false
+	-- trip log: distance, seconds, what was used (a = apparate, b<n> = blinks, f = fly)
+	W.trips = W.trips or {}
+	table.insert(W.trips, 1, string.format("%dm %.1fs %s%s", d0, os.clock() - t0, table.concat(W.tripInfo, ""), res and "" or " (aborted)"))
+	if #W.trips > 30 then table.remove(W.trips) end
 	if not ok then W.log[#W.log + 1] = "travel: " .. tostring(res) return false end
 	return res
 end
@@ -458,12 +531,14 @@ function W._travel(goal, above, exact)
 	local royal = asp and asp.Name == "Royal Apparate"
 	local cheap = asp and (asp:GetAttribute("HealthCost") or 50) < 35
 	if cfg.useApparate and not (W.noApparate and not cheap) and dist > (royal and cfg.royalApparateMin or cfg.apparateMin) and #W.threats(350, target) == 0 and W.apparate(target) then
+		table.insert(W.tripInfo or {}, "a ")
 		r = hrp()
 		dist = (target - r.Position).Magnitude
 	end
 	-- a blink burst covers the first ~600 studs in ~3s, the broom does the rest
 	if cfg.blinkTravel and dist > 200 and not (char() and char():GetAttribute("JetPacking")) then
-		W.blinkBurst(target, nil, token)
+		local nb = W.blinkBurst(target, nil, token)
+		table.insert(W.tripInfo or {}, "b" .. nb .. " ")
 		if token ~= W.travelToken then return false end
 		r = hrp()
 		dist = (Vector3.new(target.X, 0, target.Z) - Vector3.new(r.Position.X, 0, r.Position.Z)).Magnitude
@@ -477,7 +552,9 @@ function W._travel(goal, above, exact)
 		return ok and W.glide(target, speed, token)
 	end
 	-- one smooth leg: constant horizontal speed, cruise over the highest ground ahead, land at the end
+	local tf = os.clock()
 	local done = W.fly(target, speed, token)
+	table.insert(W.tripInfo or {}, string.format("f%s%d/%.0fs", speed == cfg.broomSpeed and "B" or "", dist, os.clock() - tf))
 	if done and cfg.dismountOnArrive then W.broomOff() end
 	return done
 end
@@ -556,7 +633,7 @@ local function onLoot(t)
 		local k = W.lootByKind[kind] or { n = 0, v = 0 }
 		k.n += 1 k.v += t:GetAttribute("SellValue")
 		W.lootByKind[kind] = k
-		pcall(appendfile, "ww_loot.txt", string.format("%s\t%s\t%d\n", kind, t.Name, t:GetAttribute("SellValue")))
+		logf("ww_loot.txt", string.format("%s\t%s\t%d\n", kind, t.Name, t:GetAttribute("SellValue")))
 	end
 end
 conn(lp.Backpack.ChildAdded, onLoot)
@@ -605,7 +682,8 @@ function W.pickSeller()
 	if not r then return end
 	local best, bd
 	for i, p in ipairs(SELLERS) do
-		local ok = not (i == 3 and not lp:GetAttribute("Noble")) and not (i == 1 and W.iAmWanted())
+		-- wanted: police and the Keep (Daybreak/Imperial guards killed us selling there with a bounty) are off
+		local ok = not (i == 3 and (not lp:GetAttribute("Noble") or W.iAmWanted())) and not (i == 1 and W.iAmWanted())
 		if ok and #W.threats(150, p) == 0 then
 			local d = (p - r.Position).Magnitude
 			if not bd or d < bd then best, bd = p, d end
@@ -739,19 +817,30 @@ local function waitArtifact()
 	local a = lp.Backpack:FindFirstChild("Artifact") or (char() and char():FindFirstChild("Artifact"))
 	if not a then return end
 	local t0 = os.clock()
+	W.holdingArtifact = true
 	while a.Parent and os.clock() - t0 < 45 and alive() do
 		status("holding artifact " .. tostring(a:GetAttribute("TimeLeft")) .. "s")
-		if #W.threats(cfg.dangerRadius + 60) > 0 then
+		-- +1000 bounty: everyone hunts us. React on the radar long before they're in range
+		-- (a rogue killed us at 5s left when we only reacted at 190 studs).
+		local th = W.threats(450)
+		local near = th[1]
+		local tr = near and W.track[near.pl]
+		if near and (near.d < 280 or (tr and (tr.closing or 0) > 15)) then
 			W.hoverPos = nil
-			local spot = W.safeSpot(400, 1600)
-			if not W.apparate(spot) then W.travel(spot, 3) end
+			local spot = W.safeSpot(700, 2400)
+			status("holding artifact: " .. near.pl.Name .. " " .. math.floor(near.d) .. "m away, moving")
+			if not W.apparate(spot, true) then
+				W.blinkBurst(W.awayPoint(hrp().Position, near.p, 700), nil)
+				W.travel(spot, 3)
+			end
 		elseif not W.hoverPos then
 			local r = hrp()
 			local gy = groundY(r.Position.X, r.Position.Z)
 			W.hoverPos = Vector3.new(r.Position.X, (gy or r.Position.Y) + 3, r.Position.Z)
 		end
-		task.wait(0.5)
+		task.wait(0.25)
 	end
+	W.holdingArtifact = false
 	W.hoverPos = nil
 end
 W.waitArtifact = waitArtifact
@@ -856,7 +945,8 @@ end
 local function isHealName(n) return n:find("Episki") ~= nil end
 local UTIL_PRIO = { Episkios = 2, ["Royal Apparate"] = 100, Apparate = 95, Lasso = 80, ["Open Sesame"] = 75, Stealio = 70, ["Invisio Maxima"] = 65, Invisio = 60, Wingardius = 55, Vocifero = 20, Revelio = 30, Repairo = 5, Lumo = 1 }
 -- measured on bandits: Bombarda one-shots 40hp, Ignisio 30 dmg cone (30 studs), Expulso 0 dmg (disarm only)
-local SPELL_ADJ = { Bombarda = 8, Ignisio = 6, Ignisium = 8, Expulso = -15, Aquarcia = -5, Haste = -12 }
+-- Matrificus: rarity 1 but 18 dmg cone every 3s = ~3x the dps of the 15s-cooldown spells
+local SPELL_ADJ = { Matrificus = 30, Bombarda = 8, Ignisio = 6, Ignisium = 8, Expulso = -15, Aquarcia = -5, Haste = -12 }
 local function statSum(it)
 	local st = it:FindFirstChild("ItemStats")
 	local n = 0
@@ -905,7 +995,15 @@ function W.desiredLoadout()
 	end
 	return want
 end
+-- InventoryEvent is a toggle: two concurrent callers flip the same item twice -> lock
 function W.autoEquipSpells()
+	if W.equipBusy then return false end
+	W.equipBusy = true
+	local ok, res = pcall(W._autoEquip)
+	W.equipBusy = false
+	return ok and res
+end
+function W._autoEquip()
 	local want = W.desiredLoadout()
 	local changed = false
 	for it, on in pairs(want) do -- unequip first to free slots
@@ -1206,10 +1304,26 @@ spawnLoop("safety", function()
 		end
 	end
 	lastHp = h.Health
+	-- last ~8s of hp/position/status for the death log
+	local r0 = hrp()
+	-- void rescue: remember the last spot with ground under us; falling far below it -> back up
+	if r0 then
+		local gy = groundY(r0.Position.X, r0.Position.Z)
+		if gy and r0.Position.Y - gy < 40 and r0.Position.Y > -50 then W.lastGround = r0.Position end
+		if r0.Position.Y < -120 and W.lastGround then
+			W.stats.voidRescues = (W.stats.voidRescues or 0) + 1
+			W.stop()
+			r0.AssemblyLinearVelocity = Vector3.zero
+			r0.CFrame = CFrame.new(W.lastGround + Vector3.new(0, 4, 0))
+		end
+	end
+	W.hpHist = W.hpHist or {}
+	table.insert(W.hpHist, { t = os.clock(), hp = math.floor(h.Health), p = r0 and r0.Position, s = W.status })
+	if #W.hpHist > 32 then table.remove(W.hpHist, 1) end
 	if cfg.avoidPlayers and #(W.heistActive and W.threats(45) or W.realThreats()) > 0 then W.dangerUntil = math.max(W.dangerUntil, os.clock() + 8) end
 	local lowHp = h.Health / h.MaxHealth * 100 < cfg.fleeHp
 	local danger = cfg.avoidPlayers and (os.clock() < W.dangerUntil or lowHp)
-	if danger and not W.fleeing and (cfg.bossFarm or cfg.artifactFarm or cfg.bankChests or cfg.autoMine) then
+	if danger and not W.fleeing and not W.holdingArtifact and (cfg.bossFarm or cfg.artifactFarm or cfg.bankChests or cfg.autoMine) then
 		W.stop() -- abort whatever we are doing; farm loop picks up the flee
 	end
 end)
@@ -1236,7 +1350,7 @@ function W.safeSpot(minFrom, maxFrom)
 	local best, bs
 	for _, c in ipairs(cands) do
 		local d = (Vector3.new(c.X, 0, c.Z) - Vector3.new(me.X, 0, me.Z)).Magnitude
-		if d >= (minFrom or 0) and d <= (maxFrom or math.huge) then
+		if d >= (minFrom or 0) and d <= (maxFrom or math.huge) and W.isLand(c.X, c.Z, 80) then
 			local nearest = 1500
 			for _, o in ipairs(others) do nearest = math.min(nearest, (Vector3.new(o.X, 0, o.Z) - Vector3.new(c.X, 0, c.Z)).Magnitude) end
 			local score = nearest - d * 0.1
@@ -1300,9 +1414,7 @@ function W.flee(reason)
 		if moved then W.stats.relocations = (W.stats.relocations or 0) + 1 end
 	end
 	if not moved then
-		local away = Vector3.new(r.Position.X - danger.X, 0, r.Position.Z - danger.Z)
-		if away.Magnitude < 1 then away = Vector3.new(1, 0, 0) end
-		W.blinkBurst(r.Position + away.Unit * 700, nil)
+		W.blinkBurst(W.awayPoint(r.Position, danger, 700), nil)
 		if dest and (dest - hrp().Position).Magnitude < 1500 then
 			W.travel(dest, 3)
 		elseif #W.realThreats() > 0 then
@@ -1344,10 +1456,26 @@ local function apparateReady()
 end
 W.apparateReady = apparateReady
 
+-- the artifact's +1000 bounty makes every player a hunter for 30s: only take it with nobody
+-- within 700 studs (radar), HP near full and an Apparate ready for the escape. Otherwise leave it
+-- for later instead of waiting around (it stays up until someone takes it).
+local function artifactOk(site)
+	local h = hum()
+	if not h or h.Health / h.MaxHealth < 0.8 then return false, "low hp" end
+	if #W.threats(700, site) > 0 then return false, "players near" end
+	if cfg.heistNeedApparate and not apparateReady() then return false, "apparate on cooldown" end
+	return true
+end
 function W.heist()
-	local targets = W.artifactTargets()
+	local targets = {}
+	for _, p in ipairs(W.artifactTargets()) do
+		if not isArtifactPrompt(p) then table.insert(targets, 1, p)
+		else
+			local ok, why = artifactOk(mdlPos(p.Parent))
+			if ok then targets[#targets + 1] = p else W.artifactSkip = why end
+		end
+	end
 	if #targets == 0 then return false end
-	table.sort(targets, function(a, b) return (isArtifactPrompt(a) and 1 or 0) < (isArtifactPrompt(b) and 1 or 0) end)
 	local site = mdlPos(targets[1].Parent)
 	-- scout with the radar (map-wide): a rogue camping the loot kills looters on arrival
 	local camp = W.threats(cfg.heistClear, site)
@@ -1363,19 +1491,16 @@ function W.heist()
 		local camp2 = W.threats(cfg.heistClear, site)
 		if #camp2 > 0 then status("heist: " .. camp2[1].pl.Name .. " showed up, abort") break end
 		if isArtifactPrompt(p) then
-			if not apparateReady() and cfg.heistNeedApparate then
-				status("heist: waiting for Apparate before the artifact")
-				local sp = apparateSpell()
-				local t0 = os.clock()
-				while not apparateReady() and os.clock() - t0 < 70 and alive() do task.wait(0.5) end
-			end
+			-- re-check: the chests just made us wanted, so now every player counts
+			local ok, why = artifactOk(site)
+			if not ok then status("heist: leaving the artifact (" .. why .. ")") break end
 			status("heist: artifact")
 			W.openPrompt(p)
 			task.wait(0.6)
 			-- escape far away right away
 			local spot = W.safeSpot(1000, 3200)
 			status("heist: escaping")
-			if not W.apparate(spot) then W.travel(spot, 3) end
+			if not W.apparate(spot, true) then W.travel(spot, 3) end
 		else
 			status("heist: chest")
 			W.openPrompt(p)
@@ -1404,7 +1529,7 @@ do
 			if d:IsA("ProximityPrompt") then
 				task.defer(function()
 					local m = d.Parent
-					pcall(appendfile, "ww_noble.txt", string.format("[%s] spawn %s (%s)\n", os.date("%H:%M:%S"), m and m:GetFullName() or "?", d.ObjectText))
+					logf("ww_noble.txt", string.format("[%s] spawn %s (%s)\n", os.date("%H:%M:%S"), m and m:GetFullName() or "?", d.ObjectText))
 				end)
 			end
 		end)
@@ -1431,7 +1556,7 @@ function W.grabNoble(p)
 	for _, t in ipairs(lp.Backpack:GetChildren()) do if not before[t] then got[#got + 1] = t.Name end end
 	local e = string.format("[%s] grabbed %s: got %s | Noble=%s Bounty=%s Illegal=%s", os.date("%H:%M:%S"), m.Name, table.concat(got, ","), tostring(lp:GetAttribute("Noble")), tostring(lp:GetAttribute("Bounty")), tostring(lp:GetAttribute("HasIllegalArtifact")))
 	W.log[#W.log + 1] = e
-	pcall(appendfile, "ww_noble.txt", e .. "\n")
+	logf("ww_noble.txt", e .. "\n")
 	W.stats.nobles = (W.stats.nobles or 0) + 1
 	return true
 end
@@ -1463,8 +1588,16 @@ local function hookDeath(c)
 		local att = {}
 		for pl, t in pairs(W.attackers) do if os.clock() < t then att[#att + 1] = pl.Name end end
 		e = e .. " | attackers: " .. table.concat(att, ",")
+		local hist = {}
+		for _, x in ipairs(W.hpHist or {}) do
+			if os.clock() - x.t < 8 then
+				hist[#hist + 1] = string.format("%.1fs:%d@%s[%s]", x.t - os.clock(), x.hp, x.p and string.format("%d,%d,%d", x.p.X, x.p.Y, x.p.Z) or "?", tostring(x.s))
+			end
+		end
+		e = e .. "\n    hist: " .. table.concat(hist, " ")
+		W.hpHist = {}
 		W.deaths[#W.deaths + 1] = e
-		pcall(appendfile, "ww_deaths.txt", e .. "\n")
+		logf("ww_deaths.txt", e .. "\n")
 		W.hoverPos = nil
 		W.heistActive = false
 		W.noApparate = false
@@ -1484,12 +1617,13 @@ spawnLoop("farm", function()
 	if cfg.autoEquipSpells and os.clock() - (W.lastEquip or 0) > 15 then W.lastEquip = os.clock() W.autoEquipSpells() end
 
 	local farmingAny = cfg.artifactFarm or cfg.bankChests or cfg.bossFarm or cfg.autoMine or cfg.nobleGrab
+	-- holding the artifact: its own escape logic (radar, early hops) beats a generic flee
+	if lp.Backpack:FindFirstChild("Artifact") or (char() and char():FindFirstChild("Artifact")) then waitArtifact() return end
 	if farmingAny and cfg.avoidPlayers then
 		local h = hum()
 		if os.clock() < W.dangerUntil then W.flee("hostile player") return end
 		if h.Health / h.MaxHealth * 100 < cfg.fleeHp then W.flee("low hp") return end
 	end
-	if lp.Backpack:FindFirstChild("Artifact") or (char() and char():FindFirstChild("Artifact")) then waitArtifact() return end
 	-- wanted: sell loot if the seller is clear, otherwise hide until the bounty clears
 	if cfg.nobleGrab then
 		-- each artifact gives its own noble spell and replaces the one you hold:
@@ -1522,7 +1656,8 @@ spawnLoop("farm", function()
 		return
 	end
 	-- never leave a fight to sell: only when no bandit is in range
-	if cfg.autoSell and trinkets() >= cfg.sellAt and farmingAny and not W.findTarget(260) then
+	-- no usable seller (players camping them while we're wanted): keep working instead of retrying
+	if cfg.autoSell and trinkets() >= cfg.sellAt and farmingAny and not W.findTarget(260) and W.pickSeller() then
 		W.sellTrinkets() return
 	end
 	if cfg.wagonLoot and farmingAny then
@@ -1599,6 +1734,8 @@ spawnLoop("combat", function()
 		return
 	end
 	if cfg.autoHeal then W.healStep() end
+	-- no offensive casts mid-trip: CastingSpell blocks dash-blinks and casting knocks us off the broom
+	if W.inTrip then return end
 	W.armorStep()
 	if W.target and (cfg.autoFire or cfg.autoSpells or cfg.bossFarm) then
 		if cfg.bossFarm and W.farming then
