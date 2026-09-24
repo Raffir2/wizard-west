@@ -853,7 +853,9 @@ function W.pickSeller()
 	for i, p in ipairs(SELLERS) do
 		-- wanted: police and the Keep (Daybreak/Imperial guards killed us selling there with a bounty) are off
 		local ok = not (i == 3 and (not lp:GetAttribute("Noble") or W.iAmWanted())) and not (i == 1 and W.iAmWanted())
-		if ok and #W.threats(150, p) == 0 then
+		-- a seller whose trip just got aborted (someone lurking there) is skipped for a while
+		ok = ok and os.clock() > ((W.sellerBlock or {})[i] or 0)
+		if ok and #W.threats(300, p) == 0 then
 			local d = (p - r.Position).Magnitude
 			if not bd or d < bd then best, bd = p, d end
 		end
@@ -896,6 +898,10 @@ function W.sellTrinkets()
 	if not sold then
 		v = sellCfgInRange()
 		sold = v ~= nil and W.trySellRemote(v)
+	end
+	if not sold then
+		W.sellerBlock = W.sellerBlock or {}
+		for i, sp in ipairs(SELLERS) do if sp == p then W.sellerBlock[i] = os.clock() + 90 end end
 	end
 	W.hoverPos = nil
 	if sold then W.broomOff() end
@@ -1173,7 +1179,9 @@ local function isHealName(n) return n:find("Episki") ~= nil end
 local UTIL_PRIO = { Episkios = 2, ["Royal Apparate"] = 100, Apparate = 95, Lasso = 80, ["Open Sesame"] = 75, Stealio = 70, ["Invisio Maxima"] = 65, Invisio = 60, Wingardius = 55, Vocifero = 20, Revelio = 30, Repairo = 5, Lumo = 1 }
 -- measured on bandits: Bombarda one-shots 40hp, Ignisio 30 dmg cone (30 studs), Expulso 0 dmg (disarm only)
 -- Matrificus: rarity 1 but 18 dmg cone every 3s = ~3x the dps of the 15s-cooldown spells
-local SPELL_ADJ = { Matrificus = 30, Bombarda = 8, Ignisio = 6, Ignisium = 8, Expulso = -15, Aquarcia = -5, Haste = -12 }
+-- Wild Magic (2 slots): Vocaralea's +25 HP stays (player bursts of ~106 dmg killed us at 125 HP),
+-- Inlisus (lightning AoE + stun, 8s cd) over Ignisium (15s cd)
+local SPELL_ADJ = { Matrificus = 30, Bombarda = 8, Ignisio = 6, Ignisium = 8, Inlisus = 20, Vocaralea = 35, Expulso = -15, Aquarcia = -5, Haste = -12 }
 local function statSum(it)
 	local st = it:FindFirstChild("ItemStats")
 	local n = 0
@@ -2110,12 +2118,19 @@ W.farmFn = function()
 		for _, p in ipairs(W.wagonTargets()) do
 			local pp = mdlPos(p.Parent)
 			if pp and #W.threats(cfg.workClear, pp) == 0 then
-				-- red chests are worth a detour: rank by distance / 3
-				local d = (pp - r.Position).Magnitude / (chestKind(p) == "red" and 3 or 1)
-				if not bd or d < bd then best, bd = p, d end
+				-- value per second: red chests are a flat $1500 (16/16 items), brown average $659
+				-- (173 items); a trip costs ~dist/100 s plus ~5 s to land and open
+				local v = chestKind(p) == "red" and 1500 or 660
+				local rate = v / ((pp - r.Position).Magnitude / 100 + 5)
+				if not bd or rate > bd then best, bd = p, rate end
 			end
 		end
-		if best then status(string.format("%s (%dm)", lootName(best), (mdlPos(best.Parent) - r.Position).Magnitude)) W.openPrompt(best) return end
+		-- a far brown wagon (< ~$18/s = 65k/h) isn't worth it while a camp is waiting
+		if best and (bd >= 18 or not (cfg.bossFarm and not W.iAmWanted() and W.missionTarget())) then
+			status(string.format("%s (%dm)", lootName(best), (mdlPos(best.Parent) - r.Position).Magnitude))
+			W.openPrompt(best)
+			return
+		end
 	end
 	W.br = "boss"
 	if cfg.bossFarm and not W.iAmWanted() then
