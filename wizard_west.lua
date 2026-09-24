@@ -2253,6 +2253,12 @@ end)
 spawnLoop("combat", function()
 	task.wait(0.12)
 	if not alive() then return end
+	-- fleeing: get away, don't shoot (twice we turned rogue +50 mid-flee: shots/AoE hitting a
+	-- player who isn't a legal target)
+	if W.fleeing then
+		if cfg.autoHeal then W.healStep() end
+		return
+	end
 	local need = cfg.silentAim or cfg.autoFire or cfg.autoSpells or cfg.bossFarm
 	local attacker = cfg.fightBack and W.attackerTarget()
 	W.target = attacker or (need and W.findTarget((cfg.bossFarm and W.farming) and 260 or nil)) or nil
