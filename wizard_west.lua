@@ -30,6 +30,8 @@ local cfg = {
 	vacuum = true,          -- collect every money/scroll drop on the map
 	autoSell = true,        -- walk to a trinket seller when the bag is worth enough
 	sellAt = 1,             -- sell when bag holds >= this many trinkets
+	sellMinValue = 2500,    -- ...and is worth this much, or a seller is within sellNear studs
+	sellNear = 450,
 	nobleGrab = true,
 	noblePrefer = "Baron",  -- swap to this artifact when it spawns (Baron = Royal Apparate)       -- take noble artifacts (Crown/Baron/Phoenix/Cloak) when they spawn
 	bankChests = true,      -- bank chests at artifact missions (trinkets, +200 bounty each -> auto cleared)
@@ -122,8 +124,16 @@ local function conn(sig, f) local c = sig:Connect(f) table.insert(W.conns, c) re
 local function spawnLoop(name, f)
 	local t = task.spawn(function()
 		while true do
+			local t0 = os.clock()
+			if name == "farm" then W.br = nil end
 			local ok, err = pcall(f)
 			if not ok then W.log[#W.log + 1] = name .. ": " .. tostring(err) task.wait(1) end
+			-- which farm step eats the time? (only long iterations)
+			if name == "farm" and os.clock() - t0 > 8 then
+				W.slowSteps = W.slowSteps or {}
+				table.insert(W.slowSteps, 1, string.format("%s %.0fs [%s]", tostring(W.br), os.clock() - t0, tostring(W.status)))
+				if #W.slowSteps > 30 then table.remove(W.slowSteps) end
+			end
 		end
 	end)
 	W.threads[name] = t
@@ -644,23 +654,34 @@ end
 W.roofed = roofed
 function W.walkIn(target)
 	local token = W.travelToken
-	local best
-	for rad = 25, 185, 20 do
+	pcall(function() lp:RequestStreamAroundAsync(target, 3) end)
+	-- open ground around the building, nearest first; the path is computed from the landing spot
+	local cands = {}
+	for rad = 25, 225, 20 do
 		for a = 0, 330, 30 do
 			local p = target + Vector3.new(math.cos(math.rad(a)) * rad, 0, math.sin(math.rad(a)) * rad)
 			local gy = groundY(p.X, p.Z)
-			if gy and math.abs(gy - target.Y) < 40 and not roofed(Vector3.new(p.X, gy, p.Z)) then best = Vector3.new(p.X, gy + 3, p.Z) break end
+			if gy and math.abs(gy - target.Y) < 40 and not roofed(Vector3.new(p.X, gy, p.Z)) then cands[#cands + 1] = Vector3.new(p.X, gy + 3, p.Z) end
 		end
-		if best then break end
+		if #cands >= 6 then break end
 	end
-	if not best then W.log[#W.log + 1] = "walkIn: no open ground near target" return false end
-	W.travel(best, 0, true)
-	W.broomOff()
-	task.wait(0.3)
-	local path = PFS:CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 8 })
-	local ok = pcall(function() path:ComputeAsync(hrp().Position - Vector3.new(0, 2.5, 0), target) end)
-	if not ok or path.Status ~= Enum.PathStatus.Success then
-		W.log[#W.log + 1] = "walkIn: no path (" .. tostring(path.Status) .. ")"
+	if #cands == 0 then W.log[#W.log + 1] = "walkIn: no open ground near target" return false end
+	local path
+	for i = 1, math.min(3, #cands) do
+		local ok = pcall(function()
+			path = PFS:CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 8 })
+			path:ComputeAsync(cands[i] - Vector3.new(0, 2.5, 0), target)
+		end)
+		if ok and path.Status == Enum.PathStatus.Success then
+			W.travel(cands[i], 0, true)
+			W.broomOff()
+			task.wait(0.3)
+			break
+		end
+		path = nil
+	end
+	if not path then
+		W.log[#W.log + 1] = "walkIn: no path from " .. math.min(3, #cands) .. " spots"
 		return false
 	end
 	W.travelToken += 1
@@ -777,6 +798,7 @@ function W.trySellRemote(v)
 	repeat task.wait(0.05) until trinkets() < n0 or os.clock() - t0 > 1.5
 	if trinkets() < n0 then
 		W.stats.sells = (W.stats.sells or 0) + 1
+		W.stats.sellMoney = (W.stats.sellMoney or 0) + (money() - m0)
 		W.stats.lastSell = string.format("%d items +$%d at %s", n0, money() - m0, v.Parent.Parent.Name)
 		return true
 	end
@@ -800,6 +822,15 @@ function W.pickSeller()
 	return best
 end
 
+-- a sell trip costs 10-15s: batch small bags unless a seller is on the way anyway
+function W.sellWorthIt()
+	local n, v = trinkets()
+	if n == 0 then return false end
+	local p = W.pickSeller()
+	if not p then return false end
+	local r = hrp()
+	return v >= cfg.sellMinValue or (r and (p - r.Position).Magnitude < cfg.sellNear)
+end
 function W.sellTrinkets()
 	local n, val = trinkets()
 	if n == 0 then return true end
@@ -887,7 +918,11 @@ function W.openPrompt(p)
 		if not gy or gy > cf.Position.Y + 6 then gy = cf.Position.Y - size.Y / 2 end -- under a roof: use the loot's floor
 		local stand = Vector3.new(spot.X, gy + 3, spot.Z)
 		if first then
-			if roofed(stand) then W.walkIn(stand) else W.travel(stand, 0, true) end
+			if roofed(stand) then
+				if not W.walkIn(stand) then t.n = math.max(t.n, 2) W.hoverPos = nil return false end
+			else
+				W.travel(stand, 0, true)
+			end
 			first = false
 		else
 			W.glide(stand, 30)
@@ -902,6 +937,7 @@ function W.openPrompt(p)
 		W.hoverPos = stand
 		if r then r.CFrame = CFrame.new(stand, Vector3.new(cf.Position.X, stand.Y, cf.Position.Z)) end
 		task.wait(0.3)
+		if #W.realThreats() > 0 then W.hoverPos = nil return false end -- don't stand still next to them
 		W.setCloak(false) -- prompts don't open while cloaked
 		fireproximityprompt(p)
 		local t0 = os.clock()
@@ -1323,7 +1359,7 @@ function W.missionTarget()
 	for _, clear in ipairs({ cfg.workClear, 300 }) do
 		local best, bd
 		for _, m in ipairs(workspace.Missions:GetChildren()) do
-			if m:IsA("Model") and not m:GetAttribute("Completed") and (m:GetAttribute("EnemiesLeft") or 0) > 0 then
+			if m:IsA("Model") and not m:GetAttribute("Completed") and (m:GetAttribute("EnemiesLeft") or 0) > 0 and os.clock() > ((W.campSkip or {})[m] or 0) then
 				-- clearing a camp unlocks its 2 rescue wagons: prefer the one that's done soonest
 				-- (flight ~120 studs/s, ~4s per bandit), skip camps with hostile players around
 				local mp = m:GetPivot().Position
@@ -1506,6 +1542,21 @@ spawnLoop("safety", function()
 	lastHp = h.Health
 	if W.iAmWanted() then
 		for _, t in ipairs(W.threats(40)) do W.hunters[t.pl.Name] = os.clock() end
+	end
+	-- desync monitor: the radar carries the server's idea of our position (not while cloaked)
+	local me = W.radar[lp.Name]
+	local rr0 = hrp()
+	if me and rr0 and os.clock() - me.t < 0.6 and not (char() and char():GetAttribute("G_Cloak")) then
+		local d = Vector3.new(me.p.X - rr0.Position.X, 0, me.p.Z - rr0.Position.Z).Magnitude
+		W.desync = d
+		-- ~0.5s of radar lag at 120/s is ~60 studs; beyond 200 the server isn't following us
+		if d > 200 then
+			W.stats.desyncSamples = (W.stats.desyncSamples or 0) + 1
+			W.stats.desyncMax = math.max(W.stats.desyncMax or 0, d)
+			W.desyncSince = W.desyncSince or os.clock()
+		else
+			W.desyncSince = nil
+		end
 	end
 	-- last ~8s of hp/position/status for the death log
 	local r0 = hrp()
@@ -1752,11 +1803,19 @@ function W.grabNoble(p)
 	if not pos then return false end
 	local near = W.threats(200, pos)
 	if #near > 0 then status("noble artifact: " .. near[1].pl.Name .. " is near it") return false end
+	W.nobleTry = W.nobleTry or {}
+	if os.clock() - (W.nobleTry[m.Name] or -1e9) < 90 then return false end
+	W.nobleTry[m.Name] = os.clock()
 	status("noble artifact: " .. m.Name)
 	W.noApparate = true
-	if roofed(pos) then W.walkIn(pos + Vector3.new(0, 1, 0)) else W.travel(pos + Vector3.new(0, 1, 0), 0, true) end
+	local arrived
+	if roofed(pos) then arrived = W.walkIn(pos + Vector3.new(0, 1, 0)) else arrived = W.travel(pos + Vector3.new(0, 1, 0), 0, true) end
 	W.noApparate = false
 	if not p.Parent then return false end
+	-- never "hover" onto a spot we didn't reach: that's a straight teleport the server snaps back
+	local r = hrp()
+	if not arrived or not r or (r.Position - pos).Magnitude > 20 then status("noble artifact: couldn't reach it") return false end
+	if #W.realThreats() > 0 then status("noble artifact: company, leaving") return false end
 	local before = {}
 	for _, t in ipairs(lp.Backpack:GetChildren()) do before[t] = true end
 	W.hoverPos = pos + Vector3.new(0, 1.5, 0)
@@ -1838,6 +1897,7 @@ spawnLoop("farm", function()
 		if h.Health / h.MaxHealth * 100 < cfg.fleeHp then W.flee("low hp") return end
 	end
 	-- wanted: sell loot if the seller is clear, otherwise hide until the bounty clears
+	W.br = "noble"
 	if cfg.nobleGrab then
 		-- each artifact gives its own noble spell and replaces the one you hold:
 		-- Baron = Royal Apparate (12s map teleport, the farming one), Cloak = Invisio Maxima, ...
@@ -1847,7 +1907,9 @@ spawnLoop("farm", function()
 			if (not mine or (kind == cfg.noblePrefer and mine ~= kind)) and W.grabNoble(p) then return end
 		end
 	end
+	W.br = "heist"
 	if (cfg.bankChests or cfg.artifactFarm) and W.heist() then return end
+	W.br = "wanted"
 	if W.iAmWanted() then W.clearBounty() end
 	-- bounty clearing (40s) and nobody around: keep farming instead of parking
 	local clearing = lp:GetAttribute("RogueTurnOffTick") and #W.threats(500) == 0
@@ -1870,10 +1932,12 @@ spawnLoop("farm", function()
 		return
 	end
 	-- never leave a fight to sell: only when no bandit is in range
+	W.br = "sell"
 	-- no usable seller (players camping them while we're wanted): keep working instead of retrying
-	if cfg.autoSell and trinkets() >= cfg.sellAt and farmingAny and not W.findTarget(260) and W.pickSeller() then
+	if cfg.autoSell and trinkets() >= cfg.sellAt and farmingAny and not W.findTarget(260) and W.sellWorthIt() then
 		W.sellTrinkets() return
 	end
+	W.br = "wagons"
 	if cfg.wagonLoot and farmingAny then
 		local r = hrp()
 		local best, bd
@@ -1887,6 +1951,7 @@ spawnLoop("farm", function()
 		end
 		if best then status(string.format("%s (%dm)", lootName(best), (mdlPos(best.Parent) - r.Position).Magnitude)) W.openPrompt(best) return end
 	end
+	W.br = "boss"
 	if cfg.bossFarm and not W.iAmWanted() then
 		local m = W.missionTarget()
 		if m then
@@ -1916,6 +1981,20 @@ spawnLoop("farm", function()
 					W.hoverPos = want
 				end
 			else
+				-- EnemiesLeft > 0 but nobody in reach (strays / not spawned): don't camp there forever
+				W.campWait = W.campWait or {}
+				local cw = W.campWait[m] or { since = os.clock() }
+				if os.clock() - (cw.last or 0) > 5 then cw.since = os.clock() end
+				cw.last = os.clock()
+				W.campWait[m] = cw
+				if os.clock() - cw.since > 12 then
+					W.campSkip = W.campSkip or {}
+					W.campSkip[m] = os.clock() + 90
+					W.campWait[m] = nil
+					W.farming = false
+					W.hoverPos = nil
+					return
+				end
 				status("waiting for bandits")
 				local wx, wz = mp.X + 70, mp.Z
 				local wait = cfg.underground and W.under(mp) or Vector3.new(wx, (groundY(wx, wz) or mp.Y) + 3, wz)
@@ -1928,6 +2007,25 @@ spawnLoop("farm", function()
 			return
 		end
 		W.farming = false
+	end
+	-- bounty clearing (we hold fire while wanted): wait next to the next camp, out of its aggro
+	-- range, so the fight starts the moment the bounty is gone instead of idling somewhere
+	if cfg.bossFarm and W.iAmWanted() and lp:GetAttribute("RogueTurnOffTick") then
+		local m = W.missionTarget()
+		if m then
+			local mp = m:GetPivot().Position
+			local r = hrp()
+			local away = Vector3.new(r.Position.X - mp.X, 0, r.Position.Z - mp.Z)
+			away = away.Magnitude > 1 and away.Unit or Vector3.new(1, 0, 0)
+			local stage = mp + away * 200
+			if W.isLand(stage.X, stage.Z, 30) and (r.Position - stage).Magnitude > 60 then
+				status(string.format("staging near %s (bounty clears in %ss)", m.Name, tostring(lp:GetAttribute("RogueTurnOffTick"))))
+				W.travel(stage, 3)
+			end
+			status(string.format("staging near %s (bounty clears in %ss)", m.Name, tostring(lp:GetAttribute("RogueTurnOffTick"))))
+			task.wait(1)
+			return
+		end
 	end
 	if cfg.autoMine then W.mineOnce() return end
 	status("idle")
