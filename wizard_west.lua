@@ -55,6 +55,7 @@ local cfg = {
 	useCloak = true,        -- Invisio / Invisio Maxima (Cloak noble): stay invisible + off the radar except while shooting
 	fightBack = true,       -- silent-aim + spells on players who attack us          -- while wanted (bounty), hide far from players until it clears
 	autoBuy = true,         -- buy next skill-tree item automatically
+	baronHunt = true,       -- PvP: take the Baron from its holder (Aquarcia -> Electrificus combo)
 	-- only chapters worth saving for: Oceanus Vortico (wiki: strongest PvE crowd control, 70 dmg in a
 	-- 40-stud vortex + 5s trap). A list with more chapters spends the savings on the next cosmetic.
 	buyOrder = { "ChOcean" },
@@ -1479,6 +1480,8 @@ function W.desiredLoadout()
 				score += SPELL_ADJ[it.Name] or 0
 				-- fire-hit contract open: carry the fire cone until it's done
 				if it.Name == "Ignisio" and W.contractWants("HitFire") then score += 60 end
+				-- Baron hunt pending: Aquarcia opens the combo (3s trap: no dodge, no Apparate)
+				if it.Name == "Aquarcia" and cfg.baronHunt and W.baronHolder and W.baronHolder() and lp:GetAttribute("Noble") ~= "Baron" then score += 70 end
 			end
 			if score then
 				byCat[cat] = byCat[cat] or {}
@@ -1536,6 +1539,7 @@ local function validTarget(m)
 	local pl = Players:GetPlayerFromCharacter(m)
 	if pl then
 		if m:GetAttribute("Safezone") then return false end
+		if W.huntTarget == pl then return true end -- Baron hunt: the one player we mean to hit
 		-- fight back only when it's legal (shooting a non-rogue makes US rogue), and while farming
 		-- leave other players alone: picking fights with rogues just ends in flees
 		local legal = isWanted(pl, m)
@@ -2331,6 +2335,147 @@ if lp.Character then task.spawn(hookDeath, lp.Character) end
 conn(lp.CharacterAdded, hookDeath)
 
 -------------------------------------------------------------------------------
+-- Baron hunt (user-approved PvP): take the Baron back from whoever holds it.
+-- Measured: HP 0 = the noble title is gone at once (no downed/execute step), the artifact is
+-- back at its spawner ~45s later ("Magical Artifacts have respawned"). Wiki combo: Aquarcia
+-- (0.5s windup, tracking bolt, target trapped 3s = can't act or apparate) -> Electrificus (88,
+-- instant) -> Inlisus (79 + stun) -> Bombarda / Matrificus: ~230 dmg in ~3s vs 125-150 HP.
+-- Looks like a normal fight: broom in at farm speed, stop ~45 studs away, cast through the
+-- wand like a player (silent aim picks the target), no teleports near the target.
+-------------------------------------------------------------------------------
+local KEEP_POS = Vector3.new(1472, 166, 1095)
+local COMBO = { "Aquarcia", "Electrificus", "Inlisus", "Bombarda", "Matrificus", "Electrificus" }
+W.hunt = { lastTry = -1e9, log = {} }
+local function huntLog(s)
+	table.insert(W.hunt.log, 1, os.date("%H:%M:%S ") .. s)
+	if #W.hunt.log > 20 then table.remove(W.hunt.log) end
+	logf("ww_hunt.txt", os.date("[%H:%M:%S] ") .. s .. "\n")
+end
+function W.baronHolder()
+	for _, pl in ipairs(Players:GetPlayers()) do
+		if pl ~= lp and pl:GetAttribute("Noble") == "Baron" then return pl end
+	end
+end
+local function wandSpell(n) local w = wand() return w and w.Spells:FindFirstChild(n) end
+-- cast like the player would: select the spell, click (the GetMouseHit hook aims at W.target)
+local function castAt(name)
+	local c, w, sp = char(), wand(), wandSpell(name)
+	if not (c and w and sp and spellReady(sp)) then return false end
+	local t0 = os.clock()
+	while c:GetAttribute("CastingSpell") and os.clock() - t0 < 2 do task.wait(0.05) end
+	equip(w)
+	sp:SetAttribute("SubEquipped", true)
+	w:Activate()
+	task.delay(0.3, function() if sp.Parent then sp:SetAttribute("SubEquipped", nil) end end)
+	t0 = os.clock()
+	repeat task.wait(0.05) until c:GetAttribute("CastingSpell") or os.clock() - t0 > 0.5
+	t0 = os.clock()
+	while c:GetAttribute("CastingSpell") and os.clock() - t0 < 2 do task.wait(0.05) end
+	return true
+end
+-- the combo against any model (players, or AI for testing); returns true when it died
+function W.combo(m, isDead)
+	W.target = m
+	for _, n in ipairs(COMBO) do
+		if isDead() then return true end
+		if castAt(n) then task.wait(0.05) end
+	end
+	local t0 = os.clock()
+	-- finish with the wand (auto-fire bolts) and whatever comes off cooldown
+	while os.clock() - t0 < 4 and not isDead() do
+		for _, n in ipairs(COMBO) do if castAt(n) then break end end
+		local w = wand()
+		if w then w:Activate() end
+		task.wait(0.25)
+	end
+	return isDead()
+end
+-- all must hold, or we don't start
+function W.huntCheck(pl)
+	if not cfg.baronHunt then return false, "off" end
+	if lp:GetAttribute("Noble") == "Baron" then return false, "we are the Baron" end
+	if os.clock() - W.hunt.lastTry < 120 then return false, "cooldown" end
+	if W.iAmWanted() then return false, "we are wanted" end
+	local h = hum()
+	if not h or h.Health / h.MaxHealth < 0.9 then return false, "our hp" end
+	local p = W.posOf(pl)
+	if not p then return false, "not on radar (cloaked?)" end
+	if (p - KEEP_POS).Magnitude < 250 then return false, "in the Royal Keep" end
+	local m = pl.Character
+	if m and (m:GetAttribute("Safezone") or m:GetAttribute("G_Cloak")) then return false, "safezone/cloak" end
+	for _, n in ipairs({ "Aquarcia", "Electrificus", "Inlisus" }) do
+		local sp = wandSpell(n)
+		if not sp then return false, n .. " not equipped" end
+		if not spellReady(sp) then return false, n .. " on cooldown" end
+	end
+	for _, q in ipairs(Players:GetPlayers()) do
+		local qp = q ~= lp and q ~= pl and W.posOf(q)
+		if qp and (qp - p).Magnitude < 200 then return false, q.Name .. " near the target" end
+	end
+	return true
+end
+function W.assassinate(pl)
+	W.hunt.lastTry = os.clock()
+	local p0 = W.posOf(pl)
+	huntLog(string.format("start on %s at %d studs", pl.Name, (p0 - hrp().Position).Magnitude))
+	W.huntTarget = pl
+	W.swinging = true -- keep the combat loop's own casts out of the sequence
+	local result = "aborted"
+	local ok, err = pcall(function()
+		-- approach: up to 3 legs toward a point beside them (they move), last one slower
+		for leg = 1, 3 do
+			local p = W.posOf(pl)
+			if not p then result = "lost them" return end
+			local r = hrp().Position
+			local flat = Vector3.new(r.X - p.X, 0, r.Z - p.Z)
+			flat = flat.Magnitude > 1 and flat.Unit or Vector3.new(1, 0, 0)
+			local spot = p + flat * 45 + Vector3.new(0, 6, 0)
+			if (spot - r).Magnitude < 25 then break end
+			local sp0 = cfg.broomSpeed
+			if (spot - r).Magnitude < 400 then cfg.broomSpeed = math.min(sp0, 90) end
+			W.travel(spot, 0, true)
+			cfg.broomSpeed = sp0
+			if #W.realThreats() > 1 then result = "others showed up" return end
+		end
+		local m = pl.Character
+		local th = m and m:FindFirstChildOfClass("Humanoid")
+		if not (m and th and m.PrimaryPart) then result = "not streamed in" return end
+		if m:GetAttribute("Safezone") or m:GetAttribute("G_Cloak") then result = "safezone/cloak" return end
+		local d = (m.PrimaryPart.Position - hrp().Position).Magnitude
+		if d > 75 then result = string.format("still %d away", d) return end
+		W.broomOff()
+		W.hoverPos = hrp().Position
+		local hp0 = th.Health
+		local dead = function() return th.Health <= 0 or pl:GetAttribute("Noble") ~= "Baron" or not m.Parent end
+		huntLog(string.format("combo at %d studs, target hp %d/%d", d, hp0, th.MaxHealth))
+		local killed = W.combo(m, dead)
+		result = killed and "KILL" or string.format("survived with %d hp", th.Health)
+	end)
+	W.swinging = false
+	W.huntTarget = nil
+	W.target = nil
+	W.hoverPos = nil
+	if not ok then result = "error " .. tostring(err) end
+	huntLog(result)
+	if result == "KILL" then
+		W.stats.baronKills = (W.stats.baronKills or 0) + 1
+		W.hunt.killedAt = os.clock()
+		W.clearBounty() -- 40s countdown; the Baron respawns ~45s after the kill
+	end
+	return result == "KILL"
+end
+-- after a kill: stay near the castle until the Baron is back (nobleGrab takes it)
+function W.huntWait()
+	if not W.hunt.killedAt or os.clock() - W.hunt.killedAt > 150 or lp:GetAttribute("Noble") == "Baron" then return false end
+	for _, p in ipairs(W.nobleTargets()) do if p.Parent and p.Parent.Name == "Baron" then return false end end
+	local e = W.entryCache["366,42,262"]
+	if e and (hrp().Position - e).Magnitude > 150 then W.travel(e + Vector3.new(0, 40, 0), 0, true) end
+	status(string.format("hunt: waiting for the Baron to respawn (%ds)", os.clock() - W.hunt.killedAt))
+	task.wait(1)
+	return true
+end
+
+-------------------------------------------------------------------------------
 -- main farm loop
 -------------------------------------------------------------------------------
 W.farmFn = function()
@@ -2350,6 +2495,18 @@ W.farmFn = function()
 	end
 	-- wanted: sell loot if the seller is clear, otherwise hide until the bounty clears
 	W.br = "noble"
+	-- Baron hunt: someone else holds it -> take it off them when everything lines up
+	if cfg.baronHunt and cfg.nobleGrab then
+		if W.huntWait() then return end
+		local holder = W.baronHolder()
+		if holder and lp:GetAttribute("Noble") ~= "Baron" then
+			local ok, why = W.huntCheck(holder)
+			W.hunt.why = holder.Name .. ": " .. (ok and "go" or why)
+			if ok and W.assassinate(holder) then return end
+		else
+			W.hunt.why = holder and "we hold it" or "nobody holds it"
+		end
+	end
 	if cfg.nobleGrab then
 		-- each artifact gives its own noble spell and replaces the one you hold:
 		-- Baron = Royal Apparate (12s map teleport, the farming one), Cloak = Invisio Maxima, ...
@@ -2837,6 +2994,7 @@ number(pF, "Heist: no rogue within (studs)", "heistClear", 50, 100, 2000)
 toggle(pF, "Use the cloak (Invisio) when travelling/wanted", "useCloak")
 toggle(pF, "Protect the Baron (no heists while holding it)", "protectBaron")
 toggle(pF, "Auto server hop on hostile servers (needs PC watchdog)", "autoHop")
+toggle(pF, "Baron hunt: take the Baron from its holder (PvP combo)", "baronHunt")
 number(pF, "Retreat below HP %", "fleeHp", 5, 10, 90)
 toggle(pF, "Lay low while wanted (bounty)", "layLow")
 toggle(pF, "Auto clear bounty (40s countdown)", "autoClearBounty")
@@ -2944,6 +3102,7 @@ function W.infoText()
 	add("loot: %s", #kk > 0 and table.concat(kk, "  ") or "-")
 	add("opened %d | sold %d ($%d) | heists %d | walk-ins %d | rollbacks %d", W.stats.opened or 0, W.stats.sells or 0, W.stats.sellMoney or 0, W.stats.heists or 0, W.stats.walkIns or 0, W.stats.rollbacks or 0)
 	add("mined %d veins (~$%d) | in cave %s", W.stats.mined or 0, W.stats.mineValue or 0, tostring(W.inCave()))
+	add("baron hunt: %s | kills %d | last: %s", tostring(W.hunt and W.hunt.why or "-"), W.stats.baronKills or 0, tostring(W.hunt and W.hunt.log[1] or "-"))
 	local wx = {}
 	for k, e in pairs(W.weatherIncome or {}) do if e.secs > 60 then wx[#wx + 1] = string.format("%s %.0fk/h (%dmin)", k, e.money / e.secs * 3.6, e.secs / 60) end end
 	add("weather now %s (%ss) | income by weather: %s", tostring(game.Lighting:GetAttribute("CurrentWeather") or "none"), tostring(game.Lighting:GetAttribute("WeatherTime")), #wx > 0 and table.concat(wx, ", ") or "-")
@@ -3002,7 +3161,7 @@ conn(Events.TrinketChestOpenEvent.OnClientEvent, function(kind, holder, tbl, ite
 		parts[#parts + 1] = type(v) == "table" and string.format("%s=r%s/%s", name, tostring(v.Rarity), tostring(v.Chance)) or string.format("%s=%s", name, tostring(v))
 	end
 	W.chestTables[key] = table.concat(parts, ", ")
-	logf("ww_chests.txt", string.format("[%s] %s (%s): %s | rolled %s", os.date("%H:%M:%S"), key, tostring(kind), W.chestTables[key], tostring(item)))
+	logf("ww_chests.txt", string.format("[%s] %s (%s): %s | rolled %s\n", os.date("%H:%M:%S"), key, tostring(kind), W.chestTables[key], tostring(item)))
 end)
 W.weatherIncome = {}
 spawnLoop("weather", function()
@@ -3017,7 +3176,7 @@ spawnLoop("weather", function()
 	if wx ~= W._wxLast then
 		local ms = {}
 		for _, mm in ipairs(workspace.Missions:GetChildren()) do ms[#ms + 1] = string.format("%s(%s)", mm.Name, tostring(mm:GetAttribute("EnemiesLeft"))) end
-		logf("ww_weather.txt", string.format("[%s] %s -> %s | money %d | missions %s", os.date("%H:%M:%S"), tostring(W._wxLast), wx, m, table.concat(ms, " ")))
+		logf("ww_weather.txt", string.format("[%s] %s -> %s | money %d | missions %s\n", os.date("%H:%M:%S"), tostring(W._wxLast), wx, m, table.concat(ms, " ")))
 	end
 	W._wxLast, W._wxMoney, W._wxT = wx, m, os.clock()
 	task.wait(5)
