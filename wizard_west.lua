@@ -36,7 +36,7 @@ local cfg = {
 	noblePrefer = "Baron",  -- swap to this artifact when it spawns (Baron = Royal Apparate)       -- take noble artifacts (Crown/Baron/Phoenix/Cloak) when they spawn
 	bankChests = true,      -- bank chests at artifact missions (trinkets, +200 bounty each -> auto cleared)
 	artifactFarm = true,    -- also steal the artifact (+1000 bounty, Diamond $1500 after 30s held)
-	heistClear = 300,       -- skip the heist while a rogue is this close to the loot
+	heistClear = 500,       -- skip the heist while a rogue is this close to the loot
 	workClear = 600,        -- camps/wagons: no rogue/hunter within this (they roam at broom speed)
 	heistNeedApparate = true, -- only grab the artifact when Apparate is ready for the escape
 	wagonLoot = true,       -- open unlocked wagon loot while farming
@@ -125,7 +125,7 @@ local function spawnLoop(name, f)
 	local t = task.spawn(function()
 		while true do
 			local t0 = os.clock()
-			if name == "farm" then W.br = nil end
+			if name == "farm" then W.br = nil W.farmIterStart = t0 end
 			local ok, err = pcall(f)
 			if not ok then W.log[#W.log + 1] = name .. ": " .. tostring(err) task.wait(1) end
 			-- which farm step eats the time? (only long iterations)
@@ -152,6 +152,7 @@ local function mdlPos(m)
 	if m:IsA("BasePart") then return m.Position end
 	if m:IsA("Attachment") then return m.WorldPosition end
 	local ok, p = pcall(function() return m:GetPivot().Position end)
+	if ok and p and p.Magnitude < 5 then return nil end -- streamed-out model without a pivot
 	return ok and p or nil
 end
 local function wand()
@@ -555,6 +556,8 @@ function W.apparate(goal, escaping)
 	if h.Health <= (sp:GetAttribute("HealthCost") or 50) + 1 then return false end
 	if (c:GetAttribute("DashStamina") or 0) < (sp:GetAttribute("StamCost") or 0) then return false end
 	W.hoverPos = nil
+	-- nothing can be cast on the broom (an aborted trip leaves us mounted)
+	if c:GetAttribute("JetPacking") then W.broomOff() task.wait(0.15) end
 	equip(w)
 	sp:SetAttribute("SubEquipped", true)
 	w.ToolListnerEvent:FireServer("Activate", hrp().Position + hrp().CFrame.LookVector * 20, hrp().Position, sp)
@@ -639,53 +642,75 @@ function W.stop() W.travelToken += 1 W.hoverPos = nil end
 -- hits the roof and the server's anti-noclip keeps us on top. Land on open ground next to the
 -- building instead and walk the navmesh path in.
 local PFS = game:GetService("PathfindingService")
+-- RequestStreamAroundAsync can hang for minutes (its timeout isn't honoured): run it on the side
+function W.streamAround(p, t)
+	local done = false
+	task.spawn(function() pcall(function() lp:RequestStreamAroundAsync(p, t) end) done = true end)
+	local t0 = os.clock()
+	while not done and os.clock() - t0 < (t or 2) + 0.3 do task.wait(0.05) end
+	return done
+end
 W.roofCache = {}
-local function roofed(p)
+local function roofed(p, noStream)
 	local key = string.format("%d,%d,%d", p.X / 4, p.Y / 4, p.Z / 4)
 	if W.roofCache[key] ~= nil then return W.roofCache[key] end
 	-- far targets aren't streamed in: a roof we can't see is still a roof
+	-- (never per candidate spot: 132 stream requests x 3s hung the farm for 8 minutes)
 	local r = hrp()
-	if r and (r.Position - p).Magnitude > 300 then pcall(function() lp:RequestStreamAroundAsync(p, 3) end) end
+	if not noStream and r and (r.Position - p).Magnitude > 300 then W.streamAround(p, 2) end
 	rayP.FilterDescendantsInstances = { workspace.Characters, workspace.Entities, workspace.Particles }
 	local hit = workspace:Raycast(p + Vector3.new(0, 3, 0), Vector3.new(0, 120, 0), rayP) ~= nil
 	W.roofCache[key] = hit
 	return hit
 end
 W.roofed = roofed
+-- entry spots that worked (key = target rounded), seeded with the castle's east side
+W.entryCache = { ["366,42,262"] = Vector3.new(1506, 175, 1051), ["364,42,264"] = Vector3.new(1506, 175, 1051) }
+local function entryKey(t) return string.format("%d,%d,%d", t.X / 4, t.Y / 4, t.Z / 4) end
 function W.walkIn(target)
-	local token = W.travelToken
-	pcall(function() lp:RequestStreamAroundAsync(target, 3) end)
-	-- open ground around the building, nearest first; the path is computed from the landing spot
+	if target.Magnitude < 5 then return false end -- unstreamed model -> origin, not a real spot
+	local key = entryKey(target)
+	-- fly close first: the building (and its navmesh) only exists on our side once streamed in
+	local cached = W.entryCache[key]
+	local r = hrp()
+	if cached then
+		W.travel(cached, 0, true)
+	elseif r and (r.Position - target).Magnitude > 250 then
+		local near = target + (r.Position - target).Unit * 200
+		W.travel(Vector3.new(near.X, target.Y + 60, near.Z), 0, true)
+	end
+	W.broomOff()
+	-- open ground around the building (nearest first); paths are computed from each spot
 	local cands = {}
-	for rad = 25, 225, 20 do
-		for a = 0, 330, 30 do
+	if cached then cands[1] = cached end
+	for rad = 30, 270, 30 do
+		for a = 0, 345, 15 do
 			local p = target + Vector3.new(math.cos(math.rad(a)) * rad, 0, math.sin(math.rad(a)) * rad)
 			local gy = groundY(p.X, p.Z)
-			if gy and math.abs(gy - target.Y) < 40 and not roofed(Vector3.new(p.X, gy, p.Z)) then cands[#cands + 1] = Vector3.new(p.X, gy + 3, p.Z) end
+			if gy and math.abs(gy - target.Y) < 60 and not roofed(Vector3.new(p.X, gy, p.Z), true) then cands[#cands + 1] = Vector3.new(p.X, gy + 3, p.Z) end
 		end
-		if #cands >= 6 then break end
+		if #cands >= 12 then break end
 	end
 	if #cands == 0 then W.log[#W.log + 1] = "walkIn: no open ground near target" return false end
-	local path
-	for i = 1, math.min(3, #cands) do
+	local path, from
+	for i = 1, math.min(10, #cands) do
 		local ok = pcall(function()
 			path = PFS:CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 8 })
 			path:ComputeAsync(cands[i] - Vector3.new(0, 2.5, 0), target)
 		end)
-		if ok and path.Status == Enum.PathStatus.Success then
-			W.travel(cands[i], 0, true)
-			W.broomOff()
-			task.wait(0.3)
-			break
-		end
+		if ok and path.Status == Enum.PathStatus.Success then from = cands[i] break end
 		path = nil
 	end
 	if not path then
-		W.log[#W.log + 1] = "walkIn: no path from " .. math.min(3, #cands) .. " spots"
+		W.log[#W.log + 1] = "walkIn: no path from " .. math.min(10, #cands) .. " spots"
 		return false
 	end
+	W.entryCache[key] = from
+	W.travel(from, 0, true)
+	W.broomOff()
+	task.wait(0.3)
 	W.travelToken += 1
-	token = W.travelToken
+	local token = W.travelToken
 	for _, wp in ipairs(path:GetWaypoints()) do
 		if token ~= W.travelToken or not alive() then return false end
 		W.glide(wp.Position + Vector3.new(0, 3, 0), 40, token)
@@ -908,7 +933,12 @@ function W.openPrompt(p)
 	local holder = p.Parent
 	if not holder then return false end
 	local cf, size
+	if holder:IsA("Model") and not holder:FindFirstChildWhichIsA("BasePart", true) then
+		-- parts streamed out: the bounding box would be the world origin (we flew there and died)
+		W.streamAround(holder:GetPivot().Position, 2)
+	end
 	if holder:IsA("Model") then cf, size = holder:GetBoundingBox() else cf, size = holder.CFrame, holder.Size end
+	if cf.Position.Magnitude < 5 then return false end
 	-- the prompt needs line of sight: stand on the ground beside the loot, try each side
 	local sides = { cf.RightVector * (size.X / 2 + 3), -cf.RightVector * (size.X / 2 + 3), cf.LookVector * (size.Z / 2 + 3), -cf.LookVector * (size.Z / 2 + 3) }
 	local first = true
@@ -1355,6 +1385,18 @@ end
 -- bandit mission farm: hover above the camp, silent-aim everything
 function W.missionTarget()
 	local r = hrp()
+	-- stay with the camp we're on until it's cleared: re-scoring every loop ping-ponged us across
+	-- the map after each kill (other players clear camps -> "fewest left" keeps changing): 34% of
+	-- the time went into "to mission" trips
+	local cur = W.curCamp
+	if cur and cur.Parent and not cur:GetAttribute("Completed") and (cur:GetAttribute("EnemiesLeft") or 0) > 0
+		and os.clock() > ((W.campSkip or {})[cur] or 0) and #W.threats(300, cur:GetPivot().Position) == 0 then
+		return cur
+	end
+	W.curCamp = W._pickCamp(r)
+	return W.curCamp
+end
+function W._pickCamp(r)
 	-- busy server: nothing clear by workClear -> accept camps with nobody within 300 rather than idle
 	for _, clear in ipairs({ cfg.workClear, 300 }) do
 		local best, bd
@@ -1475,8 +1517,9 @@ function W.realThreats()
 		local tr = pl and W.track[pl]
 		local approaching = tr and tr.closing and tr.closing > 12
 		local attacker = pl and W.attackers[pl] and os.clock() < W.attackers[pl]
-		-- a rogue 147 studs away one-shot 106 HP off us: anyone within 160 is too close
-		if t.d < 160 or approaching or attacker then out[#out + 1] = t end
+		-- within 90 always; further out only when they come at us or already hit us
+		-- (160 for everyone meant 16 flees / 10 min on a busy server; a flee costs ~7s)
+		if t.d < 90 or approaching or attacker or (isHunter(pl) and t.d < 160) then out[#out + 1] = t end
 	end
 	return out
 end
@@ -1574,7 +1617,8 @@ spawnLoop("safety", function()
 	W.hpHist = W.hpHist or {}
 	table.insert(W.hpHist, { t = os.clock(), hp = math.floor(h.Health), p = r0 and r0.Position, s = W.status })
 	if #W.hpHist > 32 then table.remove(W.hpHist, 1) end
-	if cfg.avoidPlayers and #(W.heistActive and W.threats(45) or W.realThreats()) > 0 then W.dangerUntil = math.max(W.dangerUntil, os.clock() + 8) end
+	-- (heists used a 45-stud radius here: two rogues camping at 29/55 studs killed us mid-heist)
+	if cfg.avoidPlayers and #W.realThreats() > 0 then W.dangerUntil = math.max(W.dangerUntil, os.clock() + 8) end
 	local lowHp = h.Health / h.MaxHealth * 100 < cfg.fleeHp
 	local danger = cfg.avoidPlayers and (os.clock() < W.dangerUntil or lowHp)
 	if danger and not W.fleeing and not W.holdingArtifact and (cfg.bossFarm or cfg.artifactFarm or cfg.bankChests or cfg.autoMine) then
@@ -1729,9 +1773,11 @@ local function artifactOk(site)
 	return true
 end
 function W.heist()
+	if os.clock() < (W.heistCooldown or 0) then return false end
 	local targets = {}
 	for _, p in ipairs(W.artifactTargets()) do
-		if not isArtifactPrompt(p) then table.insert(targets, 1, p)
+		if not mdlPos(p.Parent) then -- not streamed in / no position: skip for now
+		elseif not isArtifactPrompt(p) then table.insert(targets, 1, p)
 		else
 			local ok, why = artifactOk(mdlPos(p.Parent))
 			if ok then targets[#targets + 1] = p else W.artifactSkip = why end
@@ -1739,6 +1785,7 @@ function W.heist()
 	end
 	if #targets == 0 then return false end
 	local site = mdlPos(targets[1].Parent)
+	if not site then return false end
 	-- scout with the radar (map-wide): a rogue camping the loot kills looters on arrival
 	local camp = W.threats(cfg.heistClear, site)
 	if #camp > 0 then
@@ -1751,7 +1798,12 @@ function W.heist()
 	for _, p in ipairs(targets) do
 		if not alive() then break end
 		local camp2 = W.threats(cfg.heistClear, site)
-		if #camp2 > 0 then status("heist: " .. camp2[1].pl.Name .. " showed up, abort") break end
+		if #camp2 > 0 then
+			status("heist: " .. camp2[1].pl.Name .. " showed up, abort")
+			-- busy bank: one chest then flee + 40s rogue is a loss; leave the heists alone for a while
+			W.heistCooldown = os.clock() + 300
+			break
+		end
 		if isArtifactPrompt(p) then
 			-- re-check: the chests just made us wanted, so now every player counts
 			local ok, why = artifactOk(site)
@@ -1881,7 +1933,7 @@ conn(lp.CharacterAdded, hookDeath)
 -------------------------------------------------------------------------------
 -- main farm loop
 -------------------------------------------------------------------------------
-spawnLoop("farm", function()
+W.farmFn = function()
 	task.wait(0.3)
 	if not alive() then W.hoverPos = nil task.wait(1) return end
 	if cfg.autoContracts then W.claimContracts() end
@@ -2029,6 +2081,21 @@ spawnLoop("farm", function()
 	end
 	if cfg.autoMine then W.mineOnce() return end
 	status("idle")
+end
+spawnLoop("farm", W.farmFn)
+-- farm watchdog: an iteration stuck > 120s (a yielding call that never returns) -> log + restart
+spawnLoop("farmwatch", function()
+	task.wait(5)
+	if W.farmIterStart and os.clock() - W.farmIterStart > 120 then
+		local tb = (debug.traceback(W.threads.farm):gsub("\n", " "))
+		W.log[#W.log + 1] = "farm hung in " .. tostring(W.br) .. ": " .. tb
+		logf("ww_deaths.txt", string.format("[%s] farm hung (%s): %s\n", os.date("%H:%M:%S"), tostring(W.status), tb))
+		pcall(task.cancel, W.threads.farm)
+		W.farmIterStart = nil
+		W.travelToken += 1
+		W.hoverPos = nil
+		spawnLoop("farm", W.farmFn)
+	end
 end)
 
 -- combat loop (targeting + auto attack + heal)
