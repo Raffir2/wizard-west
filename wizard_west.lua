@@ -54,6 +54,9 @@ local cfg = {
 	flyHeight = 22,         -- broom cruise height above ground/roofs
 	undergroundDepth = 14,
 	fightDistance = 24,     -- bandit farm: stand on the ground this far from the target
+	blinkTravel = true,     -- dash-blink 120 studs during travel (server accepts it after DashEvent)
+	blinkReserve = 33,
+	dismountOnArrive = true, -- get off the broom on arrival so dash stamina refills      -- keep this much dash stamina for emergencies
 	useApparate = true,     -- use Apparate spell for trips > apparateMin studs
 	apparateMin = 900,
 	-- combat
@@ -149,6 +152,17 @@ conn(RS.Heartbeat, function()
 	end
 end)
 
+function W.broomOff()
+	local c = char()
+	if not (c and c:GetAttribute("JetPacking")) then return end
+	for _, f in ipairs(lp.Backpack:GetChildren()) do
+		if f:GetAttribute("FlightModel") and f:FindFirstChild("ToolListnerEvent") then
+			c:SetAttribute("JetPacking", nil)
+			f.ToolListnerEvent:FireServer("Activate", false)
+			return
+		end
+	end
+end
 function W.broomOn()
 	local c = char()
 	if not c or c:GetAttribute("JetPacking") then return c and c:GetAttribute("JetPacking") ~= nil end
@@ -163,6 +177,31 @@ function W.broomOn()
 	b.ToolListnerEvent:FireServer("Activate")
 	for _ = 1, 15 do task.wait(0.1) if c:GetAttribute("JetPacking") then return true end end
 	return false
+end
+
+-- DashForward is a 128-stud blink done client side; after DashEvent the server accepts the jump
+function W.canBlink(reserve)
+	local c = char()
+	if not c then return false end
+	if (c:GetAttribute("DashStamina") or 0) < 33 + (reserve or 0) then return false end
+	if workspace:GetServerTimeNow() <= (c:GetAttribute("DashCD") or 0) then return false end
+	if c:GetAttribute("CastingSpell") or c:GetAttribute("Ragdolled") or lp:GetAttribute("Jailed") then return false end
+	return os.clock() - (W.lastBlink or 0) > 0.9
+end
+function W.blinkTo(pos)
+	local r = hrp()
+	if not r or not W.canBlink(0) then return false end
+	local d = pos - r.Position
+	if d.Magnitude > 120 then pos = r.Position + d.Unit * 120 end
+	W.lastBlink = os.clock()
+	Events.DashEvent:FireServer("DashForward", false)
+	task.wait(0.08)
+	r = hrp()
+	if not r then return false end
+	r.AssemblyLinearVelocity = Vector3.zero
+	r.CFrame = CFrame.new(pos) * (r.CFrame - r.CFrame.Position)
+	W.stats.blinks = (W.stats.blinks or 0) + 1
+	return true
 end
 
 -- straight CFrame glide with server-rollback detection (speed backs off automatically)
@@ -256,6 +295,20 @@ function W.travel(goal, above, exact)
 		r = hrp()
 		dist = (target - r.Position).Magnitude
 	end
+	-- broom flight drains dash stamina, so spend spare stamina on blinks first
+	if cfg.blinkTravel and not (char() and char():GetAttribute("JetPacking")) then
+		while dist > 200 and W.canBlink(cfg.blinkReserve) and token == W.travelToken do
+			local rr = hrp()
+			local dir = Vector3.new(target.X - rr.Position.X, 0, target.Z - rr.Position.Z)
+			local to = rr.Position + dir.Unit * 120
+			local gy = groundY(to.X, to.Z)
+			if not W.blinkTo(Vector3.new(to.X, (gy and gy + 4) or rr.Position.Y, to.Z)) then break end
+			local tw = os.clock()
+			repeat task.wait(0.1) until W.canBlink(cfg.blinkReserve) or os.clock() - tw > 1.6
+			rr = hrp()
+			dist = (Vector3.new(target.X, 0, target.Z) - Vector3.new(rr.Position.X, 0, rr.Position.Z)).Magnitude
+		end
+	end
 	local speed = cfg.travelSpeed
 	if cfg.broomTravel and not cfg.underground and dist > 40 and W.broomOn() and os.clock() >= (W.slowUntil or 0) then speed = cfg.broomSpeed end
 	r = hrp()
@@ -271,7 +324,17 @@ function W.travel(goal, above, exact)
 	if not ok then return false end
 	local flat = Vector3.new(target.X - from.X, 0, target.Z - from.Z)
 	local n = math.max(1, math.floor(flat.Magnitude / 40))
-	for i = 1, n do
+	local i = 0
+	while i < n do
+		i += 1
+		-- blink 3 waypoints (120 studs) ahead when stamina allows
+		if cfg.blinkTravel and n - i >= 4 and W.canBlink(cfg.blinkReserve) then
+			local j = i + 2
+			local bp = from + flat * (j / n)
+			local by = surfY(bp.X, bp.Z) or lastY
+			if W.blinkTo(Vector3.new(bp.X, by, bp.Z)) then lastY = by i = j + 1 end
+			if token ~= W.travelToken then return false end
+		end
 		local p = from + flat * (i / n)
 		local y = surfY(p.X, p.Z)
 		if y then
@@ -285,7 +348,9 @@ function W.travel(goal, above, exact)
 		if not ok then return false end
 	end
 	if W.undergroundArrive and cfg.underground then return true end
-	return (W.glide(target, speed, token))
+	local done = W.glide(target, speed, token)
+	if done and cfg.dismountOnArrive then W.broomOff() end
+	return done
 end
 -- a spot under the terrain at (x,z)
 function W.under(p)
@@ -792,7 +857,7 @@ spawnLoop("safety", function()
 	if cfg.avoidPlayers and #W.threats(W.heistActive and 45 or cfg.dangerRadius) > 0 then W.dangerUntil = math.max(W.dangerUntil, os.clock() + 8) end
 	local lowHp = h.Health / h.MaxHealth * 100 < cfg.fleeHp
 	local danger = cfg.avoidPlayers and (os.clock() < W.dangerUntil or lowHp)
-	if danger and not W.fleeing and (cfg.bossFarm or cfg.artifactFarm or cfg.autoMine or W.travelling) then
+	if danger and not W.fleeing and (cfg.bossFarm or cfg.artifactFarm or cfg.autoMine) then
 		W.stop() -- abort whatever we are doing; farm loop picks up the flee
 	end
 end)
@@ -841,6 +906,18 @@ function W.flee(reason)
 	W.stats.flees = (W.stats.flees or 0) + 1
 	local spot = W.safeSpot(500, 1800)
 	local r = hrp()
+	-- instant distance first: up to 3 blinks toward the escape spot
+	for _ = 1, 3 do
+		local rr = hrp()
+		if not rr or not W.canBlink(0) then break end
+		local dir = Vector3.new(spot.X - rr.Position.X, 0, spot.Z - rr.Position.Z)
+		if dir.Magnitude < 150 then break end
+		local to = rr.Position + dir.Unit * 120
+		local gy = groundY(to.X, to.Z)
+		W.blinkTo(Vector3.new(to.X, math.max((gy or to.Y) + 4, rr.Position.Y), to.Z))
+		task.wait(0.35)
+	end
+	r = hrp()
 	-- Apparate is instant, use it if it's off cooldown and we can afford the HP
 	local sp = apparateSpell()
 	if sp and (spot - r.Position).Magnitude > 300 and W.apparate(spot) then
@@ -1306,6 +1383,8 @@ toggle(pT, "Ride broom while travelling (faster)", "broomTravel")
 number(pT, "Broom glide speed", "broomSpeed", 5, 40, 160)
 toggle(pT, "Travel/wait underground (out of view)", "underground")
 number(pT, "Underground depth", "undergroundDepth", 1, 6, 60)
+toggle(pT, "Dash-blink 120 studs while travelling", "blinkTravel")
+number(pT, "Keep dash stamina", "blinkReserve", 1, 0, 66)
 toggle(pT, "Use Apparate for long trips", "useApparate")
 number(pT, "Apparate when farther than", "apparateMin", 50, 200, 5000)
 header(pT, "go to")
