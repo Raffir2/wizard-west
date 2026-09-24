@@ -695,12 +695,20 @@ function W.walkIn(target)
 	if #cands == 0 then W.log[#W.log + 1] = "walkIn: no open ground near target" return false end
 	local path, from
 	for i = 1, math.min(10, #cands) do
-		local ok = pcall(function()
-			path = PFS:CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 8 })
-			path:ComputeAsync(cands[i] - Vector3.new(0, 2.5, 0), target)
-		end)
-		if ok and path.Status == Enum.PathStatus.Success then from = cands[i] break end
-		path = nil
+		-- the goal itself can sit inside the artifact's collision box (NoPath): also try a spot
+		-- 5 studs in front of it, toward the entry
+		local flat = Vector3.new(cands[i].X - target.X, 0, cands[i].Z - target.Z)
+		local goals = { target }
+		if flat.Magnitude > 1 then goals[2] = target + flat.Unit * 5 end
+		for _, goal in ipairs(goals) do
+			local ok = pcall(function()
+				path = PFS:CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 8 })
+				path:ComputeAsync(cands[i] - Vector3.new(0, 2.5, 0), goal)
+			end)
+			if ok and path.Status == Enum.PathStatus.Success then from = cands[i] break end
+			path = nil
+		end
+		if path then break end
 	end
 	if not path then
 		W.log[#W.log + 1] = "walkIn: no path from " .. math.min(10, #cands) .. " spots"
@@ -967,6 +975,10 @@ function W.openPrompt(p)
 		else
 			W.glide(stand, 30)
 		end
+		-- the trip got aborted (danger / low hp): never "hover" onto a spot we're not at - that's a
+		-- teleport the server snaps back, over and over (we bled out flipping between two places)
+		local rr = hrp()
+		if not rr or (rr.Position - stand).Magnitude > 25 then W.hoverPos = nil note("not there", si) return false end
 		tArrive = tArrive or os.clock()
 		if not p.Parent then note("gone", si) return false end
 		if W.flyBlocked then -- roof over the loot: skip it for a while
@@ -1235,8 +1247,11 @@ local function validTarget(m)
 	local pl = Players:GetPlayerFromCharacter(m)
 	if pl then
 		if m:GetAttribute("Safezone") then return false end
-		if W.attackers and W.attackers[pl] and os.clock() < W.attackers[pl] then return true end -- always fight back
-		if not cfg.aimPlayers then return false end
+		-- fight back only when it's legal (shooting a non-rogue makes US rogue), and while farming
+		-- leave other players alone: picking fights with rogues just ends in flees
+		local legal = isWanted(pl, m)
+		if W.attackers and W.attackers[pl] and os.clock() < W.attackers[pl] then return legal end
+		if not cfg.aimPlayers or (cfg.bossFarm and W.farming) then return false end
 		if cfg.onlyWanted and not isWanted(pl, m) then return false end
 		return true
 	end
@@ -1482,8 +1497,10 @@ spawnLoop("heartbeat", function()
 	table.insert(W.moneyHist, { t = os.clock(), m = money() })
 	while W.moneyHist[1] and os.clock() - W.moneyHist[1].t > 600 do table.remove(W.moneyHist, 1) end
 	local flag = dc and "DC" or "OK"
-	if not dc and W.hopWanted() then
+	if W.hopRequested then flag = "HOP" end -- sticky: the watchdog polls every 20s
+	if not dc and not W.hopRequested and W.hopWanted() then
 		flag = "HOP"
+		W.hopRequested = true
 		pcall(writefile, "ww_hop.txt", tostring(os.time()))
 		logf("ww_deaths.txt", string.format("[%s] server hop requested: %s\n", os.date("%H:%M:%S"), tostring(W.hopReason)))
 	end
@@ -2088,7 +2105,7 @@ W.farmFn = function()
 				if not W.hoverPos or (W.hoverPos - want).Magnitude > 12 then
 					W.hoverPos = nil
 					W.glide(want, cfg.travelSpeed)
-					W.hoverPos = want
+					if hrp() and (hrp().Position - want).Magnitude < 15 then W.hoverPos = want end
 				end
 			else
 				-- EnemiesLeft > 0 but nobody in reach (strays / not spawned): don't camp there forever
@@ -2111,7 +2128,7 @@ W.farmFn = function()
 				if not W.hoverPos or (W.hoverPos - wait).Magnitude > 5 then
 					W.hoverPos = nil
 					W.glide(wait, cfg.travelSpeed)
-					W.hoverPos = wait
+					if hrp() and (hrp().Position - wait).Magnitude < 15 then W.hoverPos = wait end
 				end
 			end
 			return
