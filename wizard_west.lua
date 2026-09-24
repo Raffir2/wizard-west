@@ -30,6 +30,7 @@ local cfg = {
 	vacuum = true,          -- collect every money/scroll drop on the map
 	autoSell = true,        -- walk to a trinket seller when the bag is worth enough
 	sellAt = 1,             -- sell when bag holds >= this many trinkets
+	nobleGrab = true,       -- take noble artifacts (Crown/Baron/Phoenix/Cloak) when they spawn
 	bankChests = true,      -- bank chests at artifact missions (trinkets, +200 bounty each -> auto cleared)
 	artifactFarm = false,   -- also steal the artifact (+1000 bounty, Diamond after 30s held)
 	heistClear = 150,       -- skip the heist while a rogue is this close to the loot
@@ -61,6 +62,7 @@ local cfg = {
 	dismountOnArrive = true, -- get off the broom on arrival so dash stamina refills      -- keep this much dash stamina for emergencies
 	useApparate = true,     -- use Apparate spell for trips > apparateMin studs
 	apparateMin = 900,
+	royalApparateMin = 350, -- Royal Apparate (nobles): 12s cooldown, 22 HP
 	-- combat
 	silentAim = true,
 	aimPlayers = true,
@@ -78,6 +80,8 @@ local cfg = {
 	noAntiSpeed = true,
 	walkSpeed = 0,          -- 0 = untouched
 	noclip = false,
+	antiRagdoll = true,
+	infJump = false,
 	broomMult = 1,          -- broom flight speed multiplier (1 = off)
 	fullbright = false,
 	-- esp
@@ -86,6 +90,21 @@ local cfg = {
 	espLoot = false,
 }
 W.cfg = cfg
+-- settings persist in ww_config.json (only keys/types that exist in the defaults are loaded)
+local HttpService = game:GetService("HttpService")
+local CFG_FILE = "ww_config.json"
+pcall(function()
+	if not (isfile and isfile(CFG_FILE)) then return end
+	local saved = HttpService:JSONDecode(readfile(CFG_FILE))
+	for k, v in pairs(saved) do
+		if cfg[k] ~= nil and type(cfg[k]) == type(v) and type(v) ~= "table" then cfg[k] = v end
+	end
+end)
+function W.saveCfg()
+	local out = {}
+	for k, v in pairs(cfg) do if type(v) ~= "table" then out[k] = v end end
+	pcall(writefile, CFG_FILE, HttpService:JSONEncode(out))
+end
 
 -------------------------------------------------------------------------------
 -- utils
@@ -377,9 +396,15 @@ function W.fly(goal, speed, token, opts)
 	return ok, speed
 end
 
+-- Royal Apparate (nobles: 12s cd, 22 HP) first, plain Apparate (60s, 50 HP) when it's the one ready
 local function apparateSpell()
 	local w = wand()
-	return w and w.Spells:FindFirstChild("Royal Apparate") or (w and w.Spells:FindFirstChild("Apparate")), w
+	if not w then return end
+	local ra, a = w.Spells:FindFirstChild("Royal Apparate"), w.Spells:FindFirstChild("Apparate")
+	local now = workspace:GetServerTimeNow()
+	if ra and now >= (ra:GetAttribute("CooldownExpire") or 0) then return ra, w end
+	if a and now >= (a:GetAttribute("CooldownExpire") or 0) then return a, w end
+	return ra or a, w
 end
 
 function W.apparate(goal, escaping)
@@ -388,9 +413,11 @@ function W.apparate(goal, escaping)
 	if not (sp and c and h) then return false end
 	if workspace:GetServerTimeNow() < (sp:GetAttribute("CooldownExpire") or 0) then return false end
 	-- keep enough HP after the cost so we don't trip the low-HP retreat
-	if not escaping and (h.Health - (sp:GetAttribute("HealthCost") or 50)) / h.MaxHealth * 100 <= math.max(cfg.fleeHp, 10) then return false end
+	local cost = sp:GetAttribute("HealthCost") or 50
+	local floor = cost < 35 and math.min(cfg.fleeHp, 30) or cfg.fleeHp -- Royal Apparate is cheap
+	if not escaping and (h.Health - cost) / h.MaxHealth * 100 <= math.max(floor, 10) then return false end
 	if h.Health <= (sp:GetAttribute("HealthCost") or 50) + 1 then return false end
-	if (c:GetAttribute("DashStamina") or 0) < (sp:GetAttribute("StamCost") or 33) then return false end
+	if (c:GetAttribute("DashStamina") or 0) < (sp:GetAttribute("StamCost") or 0) then return false end
 	W.hoverPos = nil
 	equip(w)
 	sp:SetAttribute("SubEquipped", true)
@@ -425,7 +452,11 @@ function W._travel(goal, above, exact)
 	local target = exact and goal or Vector3.new(goal.X, math.max(goal.Y, (gy or goal.Y)) + above, goal.Z)
 	local dist = (Vector3.new(target.X, 0, target.Z) - Vector3.new(r.Position.X, 0, r.Position.Z)).Magnitude
 	-- never Apparate into company: it costs half our HP
-	if cfg.useApparate and not W.noApparate and dist > cfg.apparateMin and #W.threats(350, target) == 0 and W.apparate(target) then
+	-- nobles get Royal Apparate (12s cd, 22 HP): use it for almost every trip
+	local asp = apparateSpell()
+	local royal = asp and asp.Name == "Royal Apparate"
+	local cheap = asp and (asp:GetAttribute("HealthCost") or 50) < 35
+	if cfg.useApparate and not (W.noApparate and not cheap) and dist > (royal and cfg.royalApparateMin or cfg.apparateMin) and #W.threats(350, target) == 0 and W.apparate(target) then
 		r = hrp()
 		dist = (target - r.Position).Magnitude
 	end
@@ -518,6 +549,13 @@ local function onLoot(t)
 		table.insert(W.loot, 1, e)
 		if #W.loot > 20 then table.remove(W.loot) end
 		W.stats.lootValue = (W.stats.lootValue or 0) + t:GetAttribute("SellValue")
+		-- per chest type (red vs brown vs bank): count + value, to see what's worth chasing
+		local kind = tostring(W.lastOpened or "?")
+		W.lootByKind = W.lootByKind or {}
+		local k = W.lootByKind[kind] or { n = 0, v = 0 }
+		k.n += 1 k.v += t:GetAttribute("SellValue")
+		W.lootByKind[kind] = k
+		pcall(appendfile, "ww_loot.txt", string.format("%s\t%s\t%d\n", kind, t.Name, t:GetAttribute("SellValue")))
 	end
 end
 conn(lp.Backpack.ChildAdded, onLoot)
@@ -624,6 +662,25 @@ local function promptFree(p)
 	return not (mx and op and op >= mx)
 end
 
+-- rescue chests: Imperial (Daybreak) camps leave a bright red chest, poacher camps a brown one.
+-- The red ones carry better loot (user report; loot log records the kind to confirm).
+local function chestKind(p)
+	local holder = p.Parent
+	if not holder then return "?" end
+	if holder.Name == "Daybreak" then return "red" end
+	local main = holder:FindFirstChild("Main")
+	if main and main:IsA("BasePart") then
+		return (main.Color.R > 0.6 and main.Color.G < 0.35) and "red" or "brown"
+	end
+	local mission = holder:FindFirstAncestor("CowboyTest")
+	return mission and "red" or "brown"
+end
+W.chestKind = chestKind
+local function lootName(p)
+	if p.ObjectText == "Animal" then return chestKind(p) .. " chest" end
+	return p.ObjectText ~= "" and p.ObjectText or (p.Parent and p.Parent.Name) or "?"
+end
+
 function W.openPrompt(p)
 	local t = W.promptTries[p] or { n = 0, last = 0 }
 	t.n += 1 t.last = os.clock()
@@ -651,7 +708,7 @@ function W.openPrompt(p)
 		repeat task.wait(0.2) until openedByMe(p) or not p.Parent or os.clock() - t0 > 1.2 + p.HoldDuration
 		if openedByMe(p) or not p.Parent then
 			W.hoverPos = nil
-			W.lastOpened, W.lastOpenT = (p.ObjectText ~= "" and p.ObjectText or holder.Name), os.clock()
+			W.lastOpened, W.lastOpenT = lootName(p), os.clock()
 			W.stats.opened = (W.stats.opened or 0) + 1
 			return true
 		end
@@ -1005,6 +1062,7 @@ function W.missionTarget()
 			-- (flight ~120 studs/s, ~4s per bandit), skip camps with hostile players around
 			local mp = m:GetPivot().Position
 			local d = (mp - r.Position).Magnitude / 120 + m:GetAttribute("EnemiesLeft") * 4
+			if m.Name == "CowboyTest" then d -= 12 end -- Imperial camp: its wagons are the red chests
 			if #W.threats(200, mp) == 0 and (not bd or d < bd) then best, bd = m, d end
 		end
 	end
@@ -1187,36 +1245,79 @@ function W.safeSpot(minFrom, maxFrom)
 	return best or me
 end
 
+-- where can we keep earning far away from `danger`? unlocked chests (red first) > camps > bank chests
+function W.productiveSpot(danger, minAway)
+	minAway = minAway or 800
+	local best, bs
+	local function consider(pos, value, land)
+		if not pos then return end
+		if danger and Vector3.new(pos.X - danger.X, 0, pos.Z - danger.Z).Magnitude < minAway then return end
+		if #W.threats(400, pos) > 0 then return end
+		if not bs or value > bs then best, bs = land or pos, value end
+	end
+	if cfg.wagonLoot then
+		for _, p in ipairs(W.wagonTargets()) do consider(mdlPos(p.Parent), W.chestKind(p) == "red" and 3000 or 1200) end
+	end
+	if cfg.bossFarm then
+		for _, m in ipairs(workspace.Missions:GetChildren()) do
+			if m:IsA("Model") and (m:GetAttribute("EnemiesLeft") or 0) > 0 then
+				local mp = m:GetPivot().Position
+				-- land beside the camp, not in the middle of it
+				consider(mp, (m.Name == "CowboyTest" and 1500 or 1000) - m:GetAttribute("EnemiesLeft") * 60, mp + Vector3.new(80, 0, 0))
+			end
+		end
+	end
+	if cfg.bankChests then
+		for _, p in ipairs(W.artifactTargets()) do consider(mdlPos(p.Parent), 1300) end
+	end
+	return best
+end
+
+-- Flee = relocate: Apparate to the most productive spot on the other side of the map and keep
+-- farming there. Without Apparate: one blink burst straight away from the threat, then carry on
+-- with work that's away from it. Only wait around when HP is actually low.
 function W.flee(reason)
 	W.fleeing = true
 	W.hoverPos = nil
-	status("FLEE: " .. reason)
 	W.stats.flees = (W.stats.flees or 0) + 1
-	local spot = W.safeSpot(500, 1800)
-	local r = hrp()
-	-- instant distance first: a full blink burst (~600 studs in ~3s)
-	W.blinkBurst(spot, nil)
-	r = hrp()
-	-- Apparate is instant, use it if it's off cooldown and we can afford the HP
+	local r, h = hrp(), hum()
+	if not (r and h) then W.fleeing = false return end
+	local th = W.realThreats()
+	local danger = (th[1] and th[1].p) or r.Position
+	local dest = W.productiveSpot(danger, 800)
+	status("FLEE: " .. reason .. (dest and " -> relocating" or ""))
 	local sp = apparateSpell()
-	local h0 = hum()
-	local canApp = sp and h0 and h0.Health > (sp:GetAttribute("HealthCost") or 50) + 2 and workspace:GetServerTimeNow() >= (sp:GetAttribute("CooldownExpire") or 0)
-	if canApp and (spot - r.Position).Magnitude > 300 and W.apparate(spot, true) then
-	else
-		W.travel(spot, 3)
+	local moved = false
+	if cfg.useApparate and sp and h.Health > (sp:GetAttribute("HealthCost") or 50) + 15 and workspace:GetServerTimeNow() >= (sp:GetAttribute("CooldownExpire") or 0) then
+		moved = W.apparate(dest or W.safeSpot(900, 3500), true)
+		if moved then W.stats.relocations = (W.stats.relocations or 0) + 1 end
 	end
-	local gy = groundY(hrp().Position.X, hrp().Position.Z)
-	W.hoverPos = Vector3.new(hrp().Position.X, (gy or hrp().Position.Y) + 3, hrp().Position.Z)
-	-- wait until healed and nobody hostile is near
-	local t0 = os.clock()
-	while alive() and os.clock() - t0 < 90 do
-		local h = hum()
-		if #W.realThreats() > 0 then
-			W.fleeing = false
-			return W.flee("followed")
+	if not moved then
+		local away = Vector3.new(r.Position.X - danger.X, 0, r.Position.Z - danger.Z)
+		if away.Magnitude < 1 then away = Vector3.new(1, 0, 0) end
+		W.blinkBurst(r.Position + away.Unit * 700, nil)
+		if dest and (dest - hrp().Position).Magnitude < 1500 then
+			W.travel(dest, 3)
+		elseif #W.realThreats() > 0 then
+			W.travel(W.safeSpot(300, 900), 3)
 		end
-		if h.Health / h.MaxHealth * 100 >= 80 and os.clock() > W.dangerUntil then break end
-		status(string.format("recovering %d%%", h.Health / h.MaxHealth * 100))
+	end
+	W.dangerUntil = 0 -- somewhere else now; the safety loop re-arms if they follow
+	local t0 = os.clock()
+	while alive() and os.clock() - t0 < 60 do
+		local hh = hum()
+		local pct = hh.Health / hh.MaxHealth * 100
+		if pct >= cfg.fleeHp + 20 or #W.realThreats() > 0 then break end
+		local w = wand()
+		for _, s in ipairs((w and w.Spells:GetChildren()) or {}) do
+			if isHeal(s.Name) and spellReady(s) then castSpell(s) break end
+		end
+		if not W.hoverPos then
+			local p = hrp().Position
+			local gy = groundY(p.X, p.Z)
+			W.hoverPos = Vector3.new(p.X, (gy or p.Y) + 3, p.Z)
+		end
+		status(string.format("healing up %d%%", pct))
 		task.wait(0.5)
 	end
 	W.hoverPos = nil
@@ -1278,6 +1379,56 @@ function W.heist()
 	return true
 end
 
+-- noble artifacts (Crown/Baron/Phoenix/Cloak) spawn in workspace.NobleStuff.ArtifactSpawners
+-- with a "Take Artifact" prompt (NobleGiver, hold 1s). Every spawn is logged to learn the timing.
+local function nobleFolder() local n = workspace:FindFirstChild("NobleStuff") return n and n:FindFirstChild("ArtifactSpawners") end
+function W.nobleTargets()
+	local out, f = {}, nobleFolder()
+	if not f then return out end
+	for _, d in ipairs(f:GetDescendants()) do
+		if d:IsA("ProximityPrompt") and d.Enabled and d.Parent then out[#out + 1] = d end
+	end
+	return out
+end
+do
+	local f = nobleFolder()
+	if f then
+		conn(f.DescendantAdded, function(d)
+			if d:IsA("ProximityPrompt") then
+				task.defer(function()
+					local m = d.Parent
+					pcall(appendfile, "ww_noble.txt", string.format("[%s] spawn %s (%s)\n", os.date("%H:%M:%S"), m and m:GetFullName() or "?", d.ObjectText))
+				end)
+			end
+		end)
+	end
+end
+function W.grabNoble(p)
+	local m = p.Parent
+	local pos = m and mdlPos(m)
+	if not pos then return false end
+	local near = W.threats(200, pos)
+	if #near > 0 then status("noble artifact: " .. near[1].pl.Name .. " is near it") return false end
+	status("noble artifact: " .. m.Name)
+	W.noApparate = true
+	W.travel(pos + Vector3.new(0, 1, 0), 0, true)
+	W.noApparate = false
+	if not p.Parent then return false end
+	local before = {}
+	for _, t in ipairs(lp.Backpack:GetChildren()) do before[t] = true end
+	W.hoverPos = pos + Vector3.new(0, 1.5, 0)
+	fireproximityprompt(p)
+	task.wait(p.HoldDuration + 2)
+	W.hoverPos = nil
+	local got = {}
+	for _, t in ipairs(lp.Backpack:GetChildren()) do if not before[t] then got[#got + 1] = t.Name end end
+	local e = string.format("[%s] grabbed %s: got %s | Noble=%s Bounty=%s Illegal=%s", os.date("%H:%M:%S"), m.Name, table.concat(got, ","), tostring(lp:GetAttribute("Noble")), tostring(lp:GetAttribute("Bounty")), tostring(lp:GetAttribute("HasIllegalArtifact")))
+	W.log[#W.log + 1] = e
+	pcall(appendfile, "ww_noble.txt", e .. "\n")
+	W.stats.nobles = (W.stats.nobles or 0) + 1
+	return true
+end
+
 -- death log: the game stamps THF_<faction> (time hit by faction) on characters
 W.deaths = {}
 local function hookDeath(c)
@@ -1325,7 +1476,7 @@ spawnLoop("farm", function()
 	if cfg.autoBuy then W.autoBuyStep() end
 	if cfg.autoEquipSpells and os.clock() - (W.lastEquip or 0) > 15 then W.lastEquip = os.clock() W.autoEquipSpells() end
 
-	local farmingAny = cfg.artifactFarm or cfg.bankChests or cfg.bossFarm or cfg.autoMine
+	local farmingAny = cfg.artifactFarm or cfg.bankChests or cfg.bossFarm or cfg.autoMine or cfg.nobleGrab
 	if farmingAny and cfg.avoidPlayers then
 		local h = hum()
 		if os.clock() < W.dangerUntil then W.flee("hostile player") return end
@@ -1333,9 +1484,14 @@ spawnLoop("farm", function()
 	end
 	if lp.Backpack:FindFirstChild("Artifact") or (char() and char():FindFirstChild("Artifact")) then waitArtifact() return end
 	-- wanted: sell loot if the seller is clear, otherwise hide until the bounty clears
+	if cfg.nobleGrab then
+		for _, p in ipairs(W.nobleTargets()) do if W.grabNoble(p) then return end end
+	end
 	if (cfg.bankChests or cfg.artifactFarm) and W.heist() then return end
 	if W.iAmWanted() then W.clearBounty() end
-	if W.iAmWanted() and (farmingAny) and cfg.layLow then
+	-- bounty clearing (40s) and nobody around: keep farming instead of parking
+	local clearing = lp:GetAttribute("RogueTurnOffTick") and #W.threats(500) == 0
+	if W.iAmWanted() and (farmingAny) and cfg.layLow and not clearing then
 		-- sell right away unless the bounty clears soon anyway (then every seller incl. police is fine)
 		if cfg.autoSell and trinkets() > 0 and not lp:GetAttribute("RogueTurnOffTick") and W.pickSeller() then W.sellTrinkets() return end
 		local spot = W.hoverPos
@@ -1362,11 +1518,12 @@ spawnLoop("farm", function()
 		for _, p in ipairs(W.wagonTargets()) do
 			local pp = mdlPos(p.Parent)
 			if pp and #W.threats(150, pp) == 0 then
-				local d = (pp - r.Position).Magnitude
+				-- red chests are worth a detour: rank by distance / 3
+				local d = (pp - r.Position).Magnitude / (chestKind(p) == "red" and 3 or 1)
 				if not bd or d < bd then best, bd = p, d end
 			end
 		end
-		if best then status(string.format("rescue wagon (%dm)", bd)) W.openPrompt(best) return end
+		if best then status(string.format("%s (%dm)", lootName(best), (mdlPos(best.Parent) - r.Position).Magnitude)) W.openPrompt(best) return end
 	end
 	if cfg.bossFarm then
 		local m = W.missionTarget()
@@ -1461,6 +1618,24 @@ conn(RS.Stepped, function()
 		local lv = c.PrimaryPart and c.PrimaryPart:FindFirstChildOfClass("LinearVelocity")
 		if lv then lv.VectorVelocity = lv.VectorVelocity * Vector3.new(cfg.broomMult, 1, cfg.broomMult) end
 	end
+end)
+
+-- anti-ragdoll: the server only sets the Ragdoll attribute; RagdollClient then puts our humanoid
+-- into Physics/PlatformStand. Skip that for our own (living) character.
+local RagdollClient = require(RepS.Modules.Client.Char.RagdollClient)
+local origRagdolled = RagdollClient.HumanoidRagdolled
+RagdollClient.HumanoidRagdolled = function(h, on, died, ...)
+	if cfg.antiRagdoll and on and not died and h == hum() then
+		W.stats.ragdollsBlocked = (W.stats.ragdollsBlocked or 0) + 1
+		h.PlatformStand = false
+		h:ChangeState(Enum.HumanoidStateType.GettingUp)
+		return
+	end
+	return origRagdolled(h, on, died, ...)
+end
+conn(UIS.JumpRequest, function()
+	local h = hum()
+	if cfg.infJump and h and not (char() and char():GetAttribute("JetPacking")) then h:ChangeState(Enum.HumanoidStateType.Jumping) end
 end)
 
 local origLight = { Brightness = Lighting.Brightness, ClockTime = Lighting.ClockTime, FogEnd = Lighting.FogEnd, GlobalShadows = Lighting.GlobalShadows, Ambient = Lighting.Ambient }
@@ -1565,7 +1740,7 @@ Instance.new("UICorner", main).CornerRadius = UDim.new(0, 8)
 local top = Instance.new("TextLabel", main)
 top.Size = UDim2.new(1, -20, 0, 30) top.Position = UDim2.new(0, 12, 0, 0) top.BackgroundTransparency = 1
 top.Font = Enum.Font.GothamBold top.TextSize = 15 top.TextColor3 = C_TXT top.TextXAlignment = Enum.TextXAlignment.Left
-top.Text = "Wizard West  ·  RightShift"
+top.Text = "Wizard West  ·  RightShift menu  ·  F6 pause farm  ·  F7 stop"
 do -- drag
 	local dragging, start, sp
 	top.InputBegan:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging, start, sp = true, i.Position, main.Position end end)
@@ -1617,7 +1792,9 @@ local function toggle(pg, text, key, onChange)
 	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 10)
 	local function paint() b.Text = cfg[key] and "ON" or "OFF" b.BackgroundColor3 = cfg[key] and C_ACC or Color3.fromRGB(60, 63, 78) b.TextColor3 = C_TXT end
 	paint()
-	b.MouseButton1Click:Connect(function() cfg[key] = not cfg[key] paint() if onChange then onChange(cfg[key]) end end)
+	b.MouseButton1Click:Connect(function() cfg[key] = not cfg[key] paint() if onChange then onChange(cfg[key]) end W.saveCfg() end)
+	W.repaint = W.repaint or {}
+	table.insert(W.repaint, paint)
 end
 local function number(pg, text, key, step, lo, hi, onChange)
 	local r = row(pg)
@@ -1628,7 +1805,7 @@ local function number(pg, text, key, step, lo, hi, onChange)
 	Instance.new("UICorner", box).CornerRadius = UDim.new(0, 4)
 	box.FocusLost:Connect(function()
 		local v = tonumber(box.Text)
-		if v then cfg[key] = math.clamp(v, lo or -math.huge, hi or math.huge) if onChange then onChange(cfg[key]) end end
+		if v then cfg[key] = math.clamp(v, lo or -math.huge, hi or math.huge) if onChange then onChange(cfg[key]) end W.saveCfg() end
 		box.Text = tostring(cfg[key])
 	end)
 end
@@ -1651,6 +1828,7 @@ header(pF, "money")
 toggle(pF, "Vacuum all money/scroll drops (map-wide)", "vacuum", applyVacuum)
 toggle(pF, "Auto sell trinkets", "autoSell")
 number(pF, "Sell when trinkets >=", "sellAt", 1, 1, 50)
+toggle(pF, "Grab noble artifacts when they spawn", "nobleGrab")
 toggle(pF, "Bank chests (+200 bounty each, auto-cleared)", "bankChests")
 toggle(pF, "Also steal the artifact (+1000 bounty)", "artifactFarm")
 button(pF, "Run one heist now", function() local a = cfg.avoidPlayers W.heist() end)
@@ -1693,6 +1871,7 @@ number(pT, "Underground depth", "undergroundDepth", 1, 6, 60)
 toggle(pT, "Blink burst at trip start (~230 studs/s)", "blinkTravel")
 toggle(pT, "Use Apparate for long trips", "useApparate")
 number(pT, "Apparate when farther than", "apparateMin", 50, 200, 5000)
+number(pT, "Royal Apparate when farther than", "royalApparateMin", 50, 150, 5000)
 header(pT, "go to")
 local names = {}
 for n in pairs(W.places) do names[#names + 1] = n end
@@ -1721,8 +1900,10 @@ number(pC, "Heal below HP %", "healAt", 5, 5, 95)
 -- Player / Visual
 local pP = page("Player")
 toggle(pP, "Disable client anti-speed freeze", "noAntiSpeed", applyAntiSpeed)
-number(pP, "WalkSpeed (0 = default, >40 risky)", "walkSpeed", 1, 0, 60)
+number(pP, "WalkSpeed (0 = default, <=60 tested clean)", "walkSpeed", 1, 0, 60)
 toggle(pP, "Noclip", "noclip")
+toggle(pP, "Anti ragdoll (stay on your feet)", "antiRagdoll")
+toggle(pP, "Infinite jump", "infJump")
 number(pP, "Broom speed multiplier (1 = off)", "broomMult", 0.1, 1, 2)
 toggle(pP, "Fullbright", "fullbright", applyFullbright)
 header(pP, "esp")
@@ -1738,7 +1919,24 @@ pages.Farm.b.BackgroundColor3 = C_ACC
 pages.Farm.f.Visible = true
 
 conn(UIS.InputBegan, function(i, gp)
-	if not gp and i.KeyCode == Enum.KeyCode.RightShift then main.Visible = not main.Visible end
+	if gp then return end
+	if i.KeyCode == Enum.KeyCode.RightShift then main.Visible = not main.Visible end
+	-- F6: pause / resume every farm mode at once
+	if i.KeyCode == Enum.KeyCode.F6 then
+		local keys = { "bossFarm", "bankChests", "artifactFarm", "autoMine", "wagonLoot", "nobleGrab" }
+		if W.paused then
+			for k, v in pairs(W.paused) do cfg[k] = v end
+			W.paused = nil
+			status("farm resumed")
+		else
+			W.paused = {}
+			for _, k in ipairs(keys) do W.paused[k] = cfg[k] cfg[k] = false end
+			W.farming = false W.stop()
+			status("farm PAUSED (F6)")
+		end
+		for _, f in ipairs(W.repaint or {}) do f() end
+	end
+	if i.KeyCode == Enum.KeyCode.F7 then W.stop() status("stopped (F7)") end
 end)
 
 -- live stats line
@@ -1746,8 +1944,8 @@ spawnLoop("stats", function()
 	task.wait(1)
 	local mins = (os.clock() - W.stats.startTime) / 60
 	local n, v = trinkets()
-	statusL.Text = string.format("%s\n$%d  |  +%d earned (%.0f/h)  |  bag %d ($%d)  |  target: %s",
-		W.status or "idle", money(), W.stats.earned, W.stats.earned / math.max(mins, 0.1) * 60, n, v, W.target and W.target.Name or "-")
+	statusL.Text = string.format("%s\n$%d  |  +%d earned (%.0f/h)  |  bag %d ($%d)  |  %s",
+		W.status or "idle", money(), W.stats.earned, W.stats.earned / math.max(mins, 0.1) * 60, n, v, W.loot[1] or (W.target and W.target.Name) or "-")
 end)
 
 -------------------------------------------------------------------------------
@@ -1757,6 +1955,7 @@ function W.cleanup()
 	for _, c in ipairs(W.conns) do pcall(function() c:Disconnect() end) end
 	for _, t in pairs(W.threads) do pcall(task.cancel, t) end
 	AntiSpeed.Update = origAntiSpeed
+	RagdollClient.HumanoidRagdolled = origRagdolled
 	pcall(function() Events.GetPlayerPositionFunc.OnClientInvoke = G.__WW_hooks.origInvoke end)
 	W.silentPos = function() end
 	cfg.fullbright = false applyFullbright()
