@@ -652,18 +652,22 @@ function W.streamAround(p, t)
 	return done
 end
 W.roofCache = {}
-local function roofed(p, noStream)
+local function roofed(p, noStream, ignore)
 	local key = string.format("%d,%d,%d", p.X / 4, p.Y / 4, p.Z / 4)
 	if W.roofCache[key] ~= nil then return W.roofCache[key] end
 	-- far targets aren't streamed in: a roof we can't see is still a roof
 	-- (never per candidate spot: 132 stream requests x 3s hung the farm for 8 minutes)
 	local r = hrp()
-	if not noStream and r and (r.Position - p).Magnitude > 300 then W.streamAround(p, 2) end
-	rayP.FilterDescendantsInstances = { workspace.Characters, workspace.Entities, workspace.Particles }
+	local loaded = r and (r.Position - p).Magnitude < 300
+	if not noStream and not loaded then loaded = W.streamAround(p, 3) end
+	rayP.FilterDescendantsInstances = { workspace.Characters, workspace.Entities, workspace.Particles, ignore }
 	local hit = workspace:Raycast(p + Vector3.new(0, 3, 0), Vector3.new(0, 120, 0), rayP) ~= nil
-	W.roofCache[key] = hit
+	-- only trust (and cache) a "no roof" when the area was actually streamed in
+	if hit or loaded then W.roofCache[key] = hit end
 	return hit
 end
+-- known indoor spots (castle interior): roofed even when the stream request times out
+W.roofCache["366,42,262"], W.roofCache["364,42,264"] = true, true
 W.roofed = roofed
 -- entry spots that worked (key = target rounded), seeded with the castle's east side
 W.entryCache = { ["366,42,262"] = Vector3.new(1506, 175, 1051), ["364,42,264"] = Vector3.new(1506, 175, 1051) }
@@ -1935,7 +1939,8 @@ function W.grabNoble(p)
 	status("noble artifact: " .. m.Name)
 	W.noApparate = true
 	local arrived
-	if roofed(pos) then arrived = W.walkIn(pos + Vector3.new(0, 1, 0)) else arrived = W.travel(pos + Vector3.new(0, 1, 0), 0, true) end
+	-- the artifact's own model (case, canopy) is not a roof
+	if roofed(pos, false, m.Parent) then arrived = W.walkIn(pos + Vector3.new(0, 1, 0)) else arrived = W.travel(pos + Vector3.new(0, 1, 0), 0, true) end
 	W.noApparate = false
 	if not p.Parent then return false end
 	-- never "hover" onto a spot we didn't reach: that's a straight teleport the server snaps back
