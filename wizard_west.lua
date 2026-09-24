@@ -43,7 +43,8 @@ local cfg = {
 	bossFarm = false,       -- bandit mission farm (combat)
 	autoMine = false,       -- mine ore veins (needs Vocare Pickaxe)
 	autoContracts = true,
-	autoHop = true,         -- hostile server (many flees/deaths, low income) -> ask the watchdog to rejoin elsewhere
+	autoHop = true,
+	protectBaron = true,    -- while holding the Baron: no heists, flee at +10% HP         -- hostile server (many flees/deaths, low income) -> ask the watchdog to rejoin elsewhere
 	-- safety
 	avoidPlayers = true,    -- flee from dangerous players
 	dangerRadius = 220,     -- a dangerous player this close (and closing in / attacking / <160) -> leave
@@ -603,7 +604,7 @@ function W._travel(goal, above, exact)
 	local asp = apparateSpell()
 	local royal = asp and asp.Name == "Royal Apparate"
 	local cheap = asp and (asp:GetAttribute("HealthCost") or 50) < 35
-	if cfg.useApparate and not (W.noApparate and not cheap) and dist > (royal and cfg.royalApparateMin or cfg.apparateMin) and #W.threats(350, target) == 0 and W.apparate(target) then
+	if cfg.useApparate and not (W.noApparate and not cheap) and dist > (royal and cfg.royalApparateMin or cfg.apparateMin) and #W.threats(cheap and 150 or 350, target) == 0 and W.apparate(target) then
 		table.insert(W.tripInfo or {}, "a ")
 		r = hrp()
 		dist = (target - r.Position).Magnitude
@@ -1480,7 +1481,7 @@ local function countSince(list, sec)
 	return n
 end
 function W.hopWanted()
-	if not cfg.autoHop or lp:GetAttribute("Noble") == "Baron" then return false end
+	if not cfg.autoHop then return false end
 	if os.clock() - W.loadedAt < 600 then return false end
 	local last = 0
 	pcall(function() last = tonumber(readfile("ww_hop.txt")) or 0 end)
@@ -1489,7 +1490,9 @@ function W.hopWanted()
 	if not old or os.clock() - old.t < 590 then return false end
 	local perHour = (money() - old.m) / (os.clock() - old.t) * 3600
 	local flees, deaths = countSince(W.fleeTimes, 600), countSince(W.deathTimes, 1200)
-	if (flees >= 8 or deaths >= 2) and perHour < 70000 then
+	-- the Baron is worth keeping unless the server is really bad
+	local baron = lp:GetAttribute("Noble") == "Baron"
+	if (flees >= (baron and 14 or 8) or deaths >= 2) and perHour < (baron and 60000 or 70000) then
 		W.hopReason = string.format("%d flees, %d deaths, %.0fk/h", flees, deaths, perHour / 1000)
 		return true
 	end
@@ -1508,7 +1511,7 @@ spawnLoop("heartbeat", function()
 		pcall(writefile, "ww_hop.txt", tostring(os.time()))
 		logf("ww_deaths.txt", string.format("[%s] server hop requested: %s\n", os.date("%H:%M:%S"), tostring(W.hopReason)))
 	end
-	pcall(writefile, "ww_hb.txt", string.format("%d %s %d %s", os.time(), flag, money(), tostring(W.status)))
+	pcall(writefile, "ww_hb.txt", string.format("%d %s %d %s %s", os.time(), flag, money(), game.JobId, tostring(W.status)))
 	task.wait(5)
 end)
 
@@ -1585,11 +1588,17 @@ function W.realThreats()
 	for _, t in ipairs(W.threats(cfg.dangerRadius)) do
 		local pl = t.pl
 		local tr = pl and W.track[pl]
-		local approaching = tr and tr.closing and tr.closing > 12
+		-- heading at us, not just flying past: most of their speed points our way (busy servers had
+		-- 19 flees / 10 min from broom traffic crossing nearby)
+		local approaching = tr and tr.closing and tr.closing > 12 and tr.closing > 0.8 * (tr.speed or 0)
 		local attacker = pl and W.attackers[pl] and os.clock() < W.attackers[pl]
 		-- within 90 always; further out only when they come at us or already hit us
 		-- (160 for everyone meant 16 flees / 10 min on a busy server; a flee costs ~7s)
-		if t.d < 90 or approaching or attacker or (isHunter(pl) and t.d < 160) then out[#out + 1] = t end
+		if t.d < 90 or approaching or attacker or (isHunter(pl) and t.d < 160) then
+			t.why = (t.d < 90 and "close" or approaching and "approach" or attacker and "attacker" or "hunter")
+			t.closing, t.speed = tr and tr.closing, tr and tr.speed
+			out[#out + 1] = t
+		end
 	end
 	return out
 end
@@ -1609,6 +1618,7 @@ spawnLoop("track", function()
 				local toMe = r.Position - p
 				local c = toMe.Magnitude > 1 and v:Dot(toMe.Unit) or 0
 				tr.closing = (tr.closing or 0) * 0.4 + c * 0.6
+				tr.speed = (tr.speed or 0) * 0.4 + v.Magnitude * 0.6
 			end
 			if not tr.t or stamp > tr.t + 0.05 then tr.p, tr.t = p, stamp end
 			tr.d = (p - r.Position).Magnitude
@@ -1691,7 +1701,15 @@ spawnLoop("safety", function()
 	table.insert(W.hpHist, { t = os.clock(), hp = math.floor(h.Health), p = r0 and r0.Position, s = W.status })
 	if #W.hpHist > 32 then table.remove(W.hpHist, 1) end
 	-- (heists used a 45-stud radius here: two rogues camping at 29/55 studs killed us mid-heist)
-	if cfg.avoidPlayers and #W.realThreats() > 0 then W.dangerUntil = math.max(W.dangerUntil, os.clock() + 8) end
+	local rt = cfg.avoidPlayers and W.realThreats() or {}
+	if #rt > 0 and os.clock() > W.dangerUntil then
+		local t = rt[1]
+		W.fleeLog = W.fleeLog or {}
+		table.insert(W.fleeLog, 1, string.format("[%s] %s %s %dm closing %s speed %s rogue %s wantedMe %s", os.date("%H:%M:%S"), t.pl.Name, t.why or "?", t.d,
+			t.closing and string.format("%.0f", t.closing) or "-", t.speed and string.format("%.0f", t.speed) or "-", tostring(t.pl:GetAttribute("Rogue") or (t.m and t.m:GetAttribute("Rogued"))), tostring(W.iAmWanted())))
+		if #W.fleeLog > 30 then table.remove(W.fleeLog) end
+	end
+	if #rt > 0 then W.dangerUntil = math.max(W.dangerUntil, os.clock() + 8) end
 	local lowHp = h.Health / h.MaxHealth * 100 < cfg.fleeHp
 	local danger = cfg.avoidPlayers and (os.clock() < W.dangerUntil or lowHp)
 	if danger and not W.fleeing and not W.holdingArtifact and (cfg.bossFarm or cfg.artifactFarm or cfg.bankChests or cfg.autoMine) then
@@ -1850,6 +1868,9 @@ end
 -- ~1100 loot vs 40s of rogue status); the farm loop calls it with true as a fallback when idle
 function W.heist(chestsOnly)
 	if os.clock() < (W.heistCooldown or 0) then return false end
+	-- holding the Baron (Royal Apparate, worth ~+100k/h): a bounty makes everyone hunt us and a death
+	-- loses the title -> no heists while we have it
+	if cfg.protectBaron and lp:GetAttribute("Noble") == "Baron" then return false end
 	local targets = {}
 	for _, p in ipairs(W.artifactTargets()) do
 		if not mdlPos(p.Parent) then -- not streamed in / no position: skip for now
