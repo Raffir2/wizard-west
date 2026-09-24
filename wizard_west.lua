@@ -56,6 +56,7 @@ local cfg = {
 	fightBack = true,       -- silent-aim + spells on players who attack us          -- while wanted (bounty), hide far from players until it clears
 	autoBuy = true,         -- buy next skill-tree item automatically
 	baronHunt = true,       -- PvP: take the Baron from its holder (Aquarcia -> Electrificus combo)
+	autoDefense = true,     -- Protego / block against players' spells (projectiles + casts aimed at us)
 	-- only chapters worth saving for: Oceanus Vortico (wiki: strongest PvE crowd control, 70 dmg in a
 	-- 40-stud vortex + 5s trap). A list with more chapters spends the savings on the next cosmetic.
 	buyOrder = { "ChOcean" },
@@ -1480,6 +1481,9 @@ function W.desiredLoadout()
 				score += SPELL_ADJ[it.Name] or 0
 				-- fire-hit contract open: carry the fire cone until it's done
 				if it.Name == "Ignisio" and W.contractWants("HitFire") then score += 60 end
+				-- auto defense: Protego (stops a whole spell, 70-90 dmg) over Vocaralea (+25 HP), Inlisus stays
+				if cfg.autoDefense and it.Name == "Protego" then score += 62 end
+				if cfg.autoDefense and it.Name == "Vocaralea" then score -= 10 end
 				-- Baron hunt pending: Aquarcia opens the combo (3s trap: no dodge, no Apparate)
 				if it.Name == "Aquarcia" and cfg.baronHunt and W.baronHolder and W.baronHolder() and lp:GetAttribute("Noble") ~= "Baron" then score += 70 end
 			end
@@ -2691,6 +2695,105 @@ spawnLoop("farmwatch", function()
 end)
 
 -- combat loop (targeting + auto attack + heal)
+-------------------------------------------------------------------------------
+-- auto defense: Protego / block against players' spells (also while farming)
+-- ShootProjectile (every bolt/spell projectile, broadcast) gives caster, missile (Speed attr,
+-- ~100-200 studs/s), start and aim point -> will it pass us, and when. Instant spells
+-- (Electrificus 88, Inlisus 79) have no projectile: a dangerous player starting a cast
+-- (CastingSpell) while facing us is the warning. Protego: Protected ~0.7s after the cast starts,
+-- lasts ~4s, 23s cd, stops the next spell. Block (BlockEvent, wand) deflects projectiles but pins
+-- us (walk speed ~0.7): held only around the impact. Nothing can be cast on the broom.
+-------------------------------------------------------------------------------
+W.defense = { blocks = 0, protegos = 0, seen = 0, log = {} }
+local function defLog(s)
+	table.insert(W.defense.log, 1, os.date("%H:%M:%S ") .. s)
+	if #W.defense.log > 12 then table.remove(W.defense.log) end
+end
+local function canDefend()
+	local c = char()
+	return cfg.autoDefense and c and alive() and not c:GetAttribute("JetPacking") and not c:GetAttribute("Ragdolled")
+end
+local blockUntil = 0
+local function doBlock(secs, why)
+	local c = char()
+	if not canDefend() or c:GetAttribute("Protected") then return end -- Protego already covers it
+	local untilT = os.clock() + math.clamp(secs, 0.3, 1.6)
+	if untilT <= blockUntil then return end
+	local fresh = os.clock() >= blockUntil
+	blockUntil = untilT
+	if not fresh then return end -- already blocking: just held longer
+	W.defending = true
+	W.defense.blocks += 1
+	defLog("block " .. why)
+	task.spawn(function()
+		local w = wand()
+		local h = hum()
+		if w and h and w.Parent ~= c then h:EquipTool(w) end
+		Events.BlockEvent:FireServer(true)
+		while os.clock() < blockUntil and alive() do task.wait(0.05) end
+		Events.BlockEvent:FireServer(false)
+		W.defending = false
+	end)
+end
+local function tryProtego(why)
+	local c = char()
+	if not canDefend() or c:GetAttribute("Protected") or c:GetAttribute("CastingSpell") then return false end
+	local w = wand()
+	local sp = w and w.Spells:FindFirstChild("Protego")
+	if not (sp and spellReady(sp)) then return false end
+	if castSpell(sp) then
+		W.defense.protegos += 1
+		defLog("protego " .. why)
+		return true
+	end
+	return false
+end
+-- who may hurt us: rogues, hunters, attackers, anyone while we're wanted, our hunt target
+local function dangerousCaster(pl)
+	if not pl or pl == lp then return false end
+	if W.huntTarget == pl then return true end
+	return hostilePl(pl, W.iAmWanted()) or (W.attackers[pl] ~= nil and os.clock() < W.attackers[pl])
+end
+conn(Events.ProjectileEvent.OnClientEvent, function(kind, caster, missile, startP, aimP)
+	if kind ~= "ShootProjectile" or not cfg.autoDefense then return end
+	local r = hrp()
+	if not (r and typeof(caster) == "Instance" and typeof(startP) == "Vector3" and typeof(aimP) == "Vector3") then return end
+	local pl = Players:GetPlayerFromCharacter(caster)
+	if not pl or pl == lp then return end -- bandit bolts: the heal handles those
+	-- does its line come near us? (tracking bolts curve toward the aim point: check that too)
+	local me = r.Position
+	local dir = aimP - startP
+	local len = dir.Magnitude
+	if len < 1 then return end
+	local u = dir / len
+	local along = math.clamp((me - startP):Dot(u), 0, len * 1.3)
+	if (startP + u * along - me).Magnitude > 10 and (aimP - me).Magnitude > 12 then return end
+	W.defense.seen += 1
+	local speed = (typeof(missile) == "Instance" and missile:GetAttribute("Speed")) or 200
+	local eta = (me - startP).Magnitude / math.max(speed, 1)
+	local name = typeof(missile) == "Instance" and missile.Name or "?"
+	if eta >= 0.8 and tryProtego(name .. " from " .. pl.Name) then return end
+	doBlock(eta + 0.35, string.format("%s from %s (%.1fs)", name, pl.Name, eta))
+end)
+-- instant spells: a dangerous player within 90 starts casting while facing us
+spawnLoop("defense", function()
+	task.wait(0.1)
+	if not canDefend() then return end
+	local r = hrp()
+	if not r then return end
+	for _, pl in ipairs(Players:GetPlayers()) do
+		local m = pl ~= lp and pl.Character
+		local pp = m and m.PrimaryPart
+		if pp and m:GetAttribute("CastingSpell") then
+			local to = r.Position - pp.Position
+			local d = to.Magnitude
+			if d < 90 and d > 1 and pp.CFrame.LookVector:Dot(to.Unit) > 0.8 and dangerousCaster(pl) then
+				if not tryProtego("cast by " .. pl.Name) then doBlock(1.3, "cast by " .. pl.Name) end
+			end
+		end
+	end
+end)
+
 spawnLoop("combat", function()
 	task.wait(0.12)
 	if not alive() then return end
@@ -2701,7 +2804,7 @@ spawnLoop("combat", function()
 		return
 	end
 	-- mining: the pickaxe must stay in hand (the miner stops swinging to let us fight)
-	if W.swinging then return end
+	if W.swinging or W.defending then return end
 	local need = cfg.silentAim or cfg.autoFire or cfg.autoSpells or cfg.bossFarm
 	local attacker = cfg.fightBack and W.attackerTarget()
 	W.target = attacker or (need and W.findTarget((cfg.bossFarm and W.farming) and 260 or nil)) or nil
@@ -2803,6 +2906,11 @@ local function espFor(obj, color, textFn)
 		e = { hl = hl, bb = bb, tl = tl, seen = 0 }
 		espCache[obj] = e
 	end
+	-- colors can change (silent-aim target turns purple and back)
+	if e.color ~= color then
+		e.color = color
+		e.hl.OutlineColor, e.hl.FillColor, e.tl.TextColor3 = color, color, color
+	end
 	e.tl.Text = textFn()
 	e.seen = os.clock()
 end
@@ -2819,9 +2927,12 @@ spawnLoop("esp", function()
 					if (pl and cfg.espPlayers) or (not pl and cfg.espAI and m:GetAttribute("IsAI")) then
 						local wanted = pl and isWanted(pl, m)
 						local col = pl and (wanted and Color3.fromRGB(255, 70, 70) or (pl:GetAttribute("Noble") and Color3.fromRGB(255, 215, 80) or Color3.fromRGB(120, 200, 255))) or Color3.fromRGB(255, 160, 60)
+						-- purple: whoever the silent aim is on right now
+						local aimed = W.target == m
+						if aimed then col = Color3.fromRGB(170, 60, 255) end
 						espFor(m, col, function()
 							local d = (m:GetPivot().Position - r.Position).Magnitude
-							local s = string.format("%s  %d/%d  %dm", m.Name, h.Health, h.MaxHealth, d)
+							local s = string.format("%s%s  %d/%d  %dm", aimed and "[TARGET] " or "", m.Name, h.Health, h.MaxHealth, d)
 							if pl then
 								local b = pl:GetAttribute("Bounty")
 								if b and b > 0 then s = s .. "  $" .. b end
@@ -2846,7 +2957,7 @@ spawnLoop("esp", function()
 			end
 			for _, v in ipairs(workspace.Resources:GetChildren()) do
 				if (v:GetAttribute("Health") or 0) > 0 then
-					espFor(v, Color3.fromRGB(200, 120, 255), function() return string.format("%s %d hp %dm", v.Name, v:GetAttribute("Health"), (v:GetPivot().Position - r.Position).Magnitude) end)
+					espFor(v, Color3.fromRGB(60, 220, 200), function() return string.format("%s %d hp %dm", v.Name, v:GetAttribute("Health"), (v:GetPivot().Position - r.Position).Magnitude) end)
 				end
 			end
 		end
@@ -3053,6 +3164,7 @@ toggle(pC, "Auto fire wand at target", "autoFire")
 toggle(pC, "Auto cast offensive spells", "autoSpells")
 toggle(pC, "Auto heal (Episkio*)", "autoHeal")
 toggle(pC, "Keep Vocaralea armor up (+25 HP)", "keepArmor")
+toggle(pC, "Auto defense: Protego / block players' spells", "autoDefense")
 number(pC, "Heal below HP %", "healAt", 5, 5, 95)
 
 -- Player / Visual
@@ -3065,7 +3177,7 @@ toggle(pP, "Infinite jump", "infJump")
 number(pP, "Broom speed multiplier (1 = off)", "broomMult", 0.1, 1, 2)
 toggle(pP, "Fullbright", "fullbright", applyFullbright)
 header(pP, "esp")
-toggle(pP, "ESP players (red = wanted, gold = noble)", "espPlayers")
+toggle(pP, "ESP players (red = wanted, gold = noble, purple = aim target)", "espPlayers")
 toggle(pP, "ESP bandits / AI", "espAI")
 toggle(pP, "ESP loot + ore veins", "espLoot")
 header(pP, "server")
@@ -3102,6 +3214,7 @@ function W.infoText()
 	add("loot: %s", #kk > 0 and table.concat(kk, "  ") or "-")
 	add("opened %d | sold %d ($%d) | heists %d | walk-ins %d | rollbacks %d", W.stats.opened or 0, W.stats.sells or 0, W.stats.sellMoney or 0, W.stats.heists or 0, W.stats.walkIns or 0, W.stats.rollbacks or 0)
 	add("mined %d veins (~$%d) | in cave %s", W.stats.mined or 0, W.stats.mineValue or 0, tostring(W.inCave()))
+	add("defense: %d incoming, %d blocks, %d protegos | last: %s", W.defense and W.defense.seen or 0, W.defense and W.defense.blocks or 0, W.defense and W.defense.protegos or 0, tostring(W.defense and W.defense.log[1] or "-"))
 	add("baron hunt: %s | kills %d | last: %s", tostring(W.hunt and W.hunt.why or "-"), W.stats.baronKills or 0, tostring(W.hunt and W.hunt.log[1] or "-"))
 	local wx = {}
 	for k, e in pairs(W.weatherIncome or {}) do if e.secs > 60 then wx[#wx + 1] = string.format("%s %.0fk/h (%dmin)", k, e.money / e.secs * 3.6, e.secs / 60) end end
