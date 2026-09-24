@@ -902,12 +902,18 @@ function W.sellTrinkets()
 	return sold or trinkets() == 0
 end
 
+-- prompts under Missions/Entities, kept up to date by events (a full descendant scan of ~2750
+-- instances ran several times per farm loop)
+W.promptSet = {}
+for _, root in ipairs({ workspace.Missions, workspace.Entities }) do
+	for _, d in ipairs(root:GetDescendants()) do if d:IsA("ProximityPrompt") then W.promptSet[d] = true end end
+	conn(root.DescendantAdded, function(d) if d:IsA("ProximityPrompt") then W.promptSet[d] = true end end)
+	conn(root.DescendantRemoving, function(d) W.promptSet[d] = nil end)
+end
 local function prompts(filter)
 	local out = {}
-	for _, root in ipairs({ workspace.Missions, workspace.Entities }) do
-		for _, p in ipairs(root:GetDescendants()) do
-			if p:IsA("ProximityPrompt") and p.Enabled and filter(p) then out[#out + 1] = p end
-		end
+	for p in pairs(W.promptSet) do
+		if p.Parent and p.Enabled and filter(p) then out[#out + 1] = p end
 	end
 	return out
 end
@@ -1351,6 +1357,8 @@ local function cloakSpell()
 end
 -- the cast costs ~1s (+ uncloaking later): only when someone could come for us
 function W.cloakUseful()
+	-- the 40s bounty clear countdown PAUSES while cloaked (measured): never cloak during it
+	if lp:GetAttribute("RogueTurnOffTick") and not W.holdingArtifact then return false end
 	if W.iAmWanted() or W.heistActive or W.holdingArtifact then return true end
 	local _, v = trinkets()
 	return v >= 1500 or #W.threats(1500) > 0
@@ -1462,6 +1470,7 @@ function W.clearBounty()
 	W.lastClear = os.clock()
 	Events.RogueEvent:FireServer()
 	W.stats.bountyClears = (W.stats.bountyClears or 0) + 1
+	task.delay(0.5, function() W.setCloak(false) end) -- the countdown doesn't run while cloaked
 	return true
 end
 
@@ -1917,6 +1926,10 @@ function W.heist(chestsOnly)
 		else
 			status("heist: chest")
 			W.openPrompt(p)
+			-- start the 40s clear right away: bounty from chests opened during the countdown is
+			-- wiped with it (measured 250 -> 450 -> nil)
+			task.wait(0.5)
+			W.clearBounty()
 		end
 	end
 	W.heistActive = false
@@ -2078,7 +2091,7 @@ W.farmFn = function()
 			local gy = groundY(r.Position.X, r.Position.Z)
 			W.hoverPos = Vector3.new(r.Position.X, (gy or r.Position.Y) + 3, r.Position.Z)
 		end
-		W.setCloak(true)
+		if W.cloakUseful() then W.setCloak(true) else W.setCloak(false) end
 		local tick = lp:GetAttribute("RogueTurnOffTick")
 		status(string.format("wanted ($%d) - laying low%s", lp:GetAttribute("Bounty") or 0, tick and (", clears in " .. tick .. "s") or ""))
 		task.wait(1)
@@ -2463,10 +2476,27 @@ header(pF, "money")
 toggle(pF, "Vacuum all money/scroll drops (map-wide)", "vacuum", applyVacuum)
 toggle(pF, "Auto sell trinkets", "autoSell")
 number(pF, "Sell when trinkets >=", "sellAt", 1, 1, 50)
+number(pF, "...and bag worth at least $", "sellMinValue", 100, 0, 1e6)
+number(pF, "...or a seller within (studs)", "sellNear", 25, 0, 3000)
 toggle(pF, "Grab noble artifacts when they spawn", "nobleGrab")
-toggle(pF, "Bank chests (+200 bounty each, auto-cleared)", "bankChests")
-toggle(pF, "Also steal the artifact (+1000 bounty)", "artifactFarm")
-button(pF, "Run one heist now", function() local a = cfg.avoidPlayers W.heist() end)
+do -- which noble title to swap to when it spawns (Baron = Royal Apparate, the farming one)
+	local r = row(pF)
+	label(r, "Preferred noble title (click to change)")
+	local b = Instance.new("TextButton", r)
+	b.Size = UDim2.new(0, 80, 0, 20) b.Position = UDim2.new(1, -88, 0.5, -10) b.Font = Enum.Font.GothamBold b.TextSize = 11
+	b.BackgroundColor3 = C_ACC b.TextColor3 = C_TXT b.Text = cfg.noblePrefer
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 10)
+	local order = { "Baron", "Cloak", "Phoenix", "Crown" }
+	b.MouseButton1Click:Connect(function()
+		local i = table.find(order, cfg.noblePrefer) or 0
+		cfg.noblePrefer = order[i % #order + 1]
+		b.Text = cfg.noblePrefer
+		W.saveCfg()
+	end)
+end
+toggle(pF, "Bank heists (with the artifact; chests alone only when idle)", "bankChests")
+toggle(pF, "Steal the artifact (Diamond $1-1.5k, +500-1000 bounty)", "artifactFarm")
+button(pF, "Run one heist now (chests even without artifact)", function() W.heist(true) end)
 toggle(pF, "Open rescue wagons (trinkets ~$1-1.5k)", "wagonLoot")
 toggle(pF, "Bandit mission farm (combat)", "bossFarm", function(v) if not v then W.farming = false W.hoverPos = nil end end)
 number(pF, "Fight distance from bandit", "fightDistance", 1, 8, 120)
@@ -2474,6 +2504,11 @@ toggle(pF, "Auto mine ore (needs Vocare Pickaxe)", "autoMine")
 header(pF, "safety")
 toggle(pF, "Flee from dangerous players", "avoidPlayers")
 number(pF, "Danger radius", "dangerRadius", 10, 40, 400)
+number(pF, "Camps/wagons: no rogue within (studs)", "workClear", 50, 100, 2000)
+number(pF, "Heist: no rogue within (studs)", "heistClear", 50, 100, 2000)
+toggle(pF, "Use the cloak (Invisio) when travelling/wanted", "useCloak")
+toggle(pF, "Protect the Baron (no heists while holding it)", "protectBaron")
+toggle(pF, "Auto server hop on hostile servers (needs PC watchdog)", "autoHop")
 number(pF, "Retreat below HP %", "fleeHp", 5, 10, 90)
 toggle(pF, "Lay low while wanted (bounty)", "layLow")
 toggle(pF, "Auto clear bounty (40s countdown)", "autoClearBounty")
@@ -2500,10 +2535,12 @@ local pT = page("Travel")
 header(pT, "settings")
 number(pT, "Glide speed (no broom, safe <=60)", "travelSpeed", 5, 20, 65)
 toggle(pT, "Ride broom while travelling (faster)", "broomTravel")
-number(pT, "Broom flight speed (<=140 clean)", "broomSpeed", 5, 40, 140)
+number(pT, "Broom flight speed (120 clean, 135+ rolls back)", "broomSpeed", 5, 40, 140)
+number(pT, "Broom acceleration (studs/s^2)", "flyAccel", 5, 10, 120)
+number(pT, "Cruise height above ground", "flyHeight", 1, 5, 60)
 toggle(pT, "Travel/wait underground (out of view)", "underground")
 number(pT, "Underground depth", "undergroundDepth", 1, 6, 60)
-toggle(pT, "Blink burst at trip start (~230 studs/s)", "blinkTravel")
+toggle(pT, "Blink burst at trip start (off: the broom leg after it rolls back)", "blinkTravel")
 toggle(pT, "Use Apparate for long trips", "useApparate")
 number(pT, "Apparate when farther than", "apparateMin", 50, 200, 5000)
 number(pT, "Royal Apparate when farther than", "royalApparateMin", 50, 150, 5000)
@@ -2546,9 +2583,53 @@ toggle(pP, "ESP players (red = wanted, gold = noble)", "espPlayers")
 toggle(pP, "ESP bandits / AI", "espAI")
 toggle(pP, "ESP loot + ore veins", "espLoot")
 header(pP, "server")
-button(pP, "Rejoin", function() TS:TeleportToPlaceInstance(game.PlaceId, game.JobId, lp) end)
-button(pP, "Server hop", function() TS:Teleport(game.PlaceId, lp) end)
+-- in-game teleports kill the executor hook (Potassium queue_on_teleport is a stub): the PC
+-- watchdog restarts Roblox into another server instead and reloads the script
+button(pP, "Server hop (via PC watchdog, keeps the script)", function() W.hopRequested = true status("hop requested - the watchdog restarts into another server") end)
+button(pP, "Rejoin via Roblox teleport (script must be re-run)", function() TS:TeleportToPlaceInstance(game.PlaceId, game.JobId, lp) end)
 button(pP, "Unload script", function() W.cleanup() end)
+
+-- Info: live dashboard of what the farm is doing and why
+local pI = page("Info")
+local infoL = Instance.new("TextLabel", pI.f)
+infoL.Size = UDim2.new(1, -6, 0, 0) infoL.AutomaticSize = Enum.AutomaticSize.Y infoL.BackgroundTransparency = 1
+infoL.Font = Enum.Font.Code infoL.TextSize = 12 infoL.TextColor3 = C_TXT infoL.TextXAlignment = Enum.TextXAlignment.Left
+infoL.TextYAlignment = Enum.TextYAlignment.Top infoL.TextWrapped = true infoL.RichText = false infoL.LayoutOrder = 1
+button(pI, "Copy info to clipboard", function() if setclipboard then setclipboard(infoL.Text) end end)
+function W.infoText()
+	local L = {}
+	local function add(fmt, ...) L[#L + 1] = string.format(fmt, ...) end
+	local old = W.moneyHist and W.moneyHist[1]
+	local rate = old and os.clock() - old.t > 30 and (money() - old.m) / (os.clock() - old.t) * 3600 or 0
+	local mins = (os.clock() - W.stats.startTime) / 60
+	add("money $%d | last %dmin: %.0fk/h | session +%d (%.0fk/h)", money(), old and (os.clock() - old.t) / 60 or 0, rate / 1000, W.stats.earned, W.stats.earned / math.max(mins, 0.1) * 60 / 1000)
+	add("noble %s | bounty %s | rogue %s | cloaked %s", tostring(lp:GetAttribute("Noble")), tostring(lp:GetAttribute("Bounty") or 0), tostring(lp:GetAttribute("Rogue") or false), tostring(char() and char():GetAttribute("G_Cloak") or false))
+	local fl, de = 0, 0
+	for _, t in ipairs(W.fleeTimes or {}) do if os.clock() - t < 600 then fl += 1 end end
+	for _, t in ipairs(W.deathTimes or {}) do if os.clock() - t < 1200 then de += 1 end end
+	add("server %s | players %d | flees 10min %d | deaths 20min %d%s", game.JobId:sub(1, 8), #Players:GetPlayers(), fl, de, W.hopRequested and (" | HOP: " .. tostring(W.hopReason or "manual")) or "")
+	local hh = {}
+	for n, t in pairs(W.hunters or {}) do if os.clock() - t < 600 then hh[#hh + 1] = n end end
+	add("hunters: %s", #hh > 0 and table.concat(hh, ", ") or "-")
+	local kk = {}
+	for k, v in pairs(W.lootByKind or {}) do kk[#kk + 1] = string.format("%s %d/$%d", k, v.n, v.v) end
+	add("loot: %s", #kk > 0 and table.concat(kk, "  ") or "-")
+	add("opened %d | sold %d ($%d) | heists %d | walk-ins %d | rollbacks %d", W.stats.opened or 0, W.stats.sells or 0, W.stats.sellMoney or 0, W.stats.heists or 0, W.stats.walkIns or 0, W.stats.rollbacks or 0)
+	add("")
+	add("recent trips:")
+	for i = 1, math.min(5, #(W.trips or {})) do add("  %s", W.trips[i]) end
+	add("recent flee triggers:")
+	for i = 1, math.min(4, #(W.fleeLog or {})) do add("  %s", W.fleeLog[i]) end
+	add("slow farm steps:")
+	for i = 1, math.min(4, #(W.slowSteps or {})) do add("  %s", W.slowSteps[i]) end
+	if W.deaths and #W.deaths > 0 then add("last death: %s", (W.deaths[#W.deaths]:gsub("\n.*", ""))) end
+	for i = math.max(1, #W.log - 3), #W.log do add("log: %s", W.log[i]) end
+	return table.concat(L, "\n")
+end
+spawnLoop("info", function()
+	task.wait(1)
+	if main.Visible and pI.f.Visible then infoL.Text = W.infoText() end
+end)
 
 pages.Farm.b.BackgroundColor3 = C_ACC
 pages.Farm.f.Visible = true
