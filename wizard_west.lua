@@ -2991,6 +2991,19 @@ end)
 -- weather: Lighting.CurrentWeather (Daybreak = Imperials, Nightfall = spider waves, Rainfall, nil)
 -- every ~16 min for 5 min (WeatherTime counts down; negative while it's on). Income per weather
 -- state + the mission list at each change go to ww_weather.txt to see what the events are worth.
+-- loot tables: every chest open (anyone's) broadcasts TrinketChestOpenEvent(kind, holder, table,
+-- item, rarity). Logged once per holder type to value chest types we haven't measured (Nightfall).
+W.chestTables = {}
+conn(Events.TrinketChestOpenEvent.OnClientEvent, function(kind, holder, tbl, item)
+	local key = typeof(holder) == "Instance" and holder.Name or tostring(kind)
+	if W.chestTables[key] or type(tbl) ~= "table" then return end
+	local parts = {}
+	for name, v in pairs(tbl) do
+		parts[#parts + 1] = type(v) == "table" and string.format("%s=r%s/%s", name, tostring(v.Rarity), tostring(v.Chance)) or string.format("%s=%s", name, tostring(v))
+	end
+	W.chestTables[key] = table.concat(parts, ", ")
+	logf("ww_chests.txt", string.format("[%s] %s (%s): %s | rolled %s", os.date("%H:%M:%S"), key, tostring(kind), W.chestTables[key], tostring(item)))
+end)
 W.weatherIncome = {}
 spawnLoop("weather", function()
 	local wx = game.Lighting:GetAttribute("CurrentWeather") or "none"
