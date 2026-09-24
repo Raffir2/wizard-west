@@ -602,7 +602,19 @@ function W._travel(goal, above, exact)
 	local target = exact and goal or Vector3.new(goal.X, math.max(goal.Y, (gy or goal.Y)) + above, goal.Z)
 	local dist = (Vector3.new(target.X, 0, target.Z) - Vector3.new(r.Position.X, 0, r.Position.Z)).Magnitude
 	-- never Apparate into company: it costs half our HP
-	-- nobles get Royal Apparate (12s cd, 22 HP): use it for almost every trip
+	-- nobles get Royal Apparate (12s cd, 22 HP): use it for almost every trip. Trips come back to
+	-- back, so it's often a few seconds short of ready: waiting <= 4s beats flying 10-25s
+	do
+		local w = wand()
+		local ra = w and w.Spells:FindFirstChild("Royal Apparate")
+		if ra and cfg.useApparate and dist > 600 and not W.fleeing then
+			local left = (ra:GetAttribute("CooldownExpire") or 0) - workspace:GetServerTimeNow()
+			if left > 0 and left < 4 then
+				status("waiting " .. math.ceil(left) .. "s for Royal Apparate")
+				task.wait(left + 0.1)
+			end
+		end
+	end
 	local asp = apparateSpell()
 	local royal = asp and asp.Name == "Royal Apparate"
 	local cheap = asp and (asp:GetAttribute("HealthCost") or 50) < 35
