@@ -626,7 +626,9 @@ function W._travel(goal, above, exact)
 	end
 	-- inside the Crystal Cave the broom hits the rock ceiling (the server yanks us back): walk out first
 	if dist > 40 and W.inCave() then
+		local prev = W.status
 		W.exitCave(token)
+		status(prev) -- the flight after it belongs to the trip, not to "leaving the cave"
 		if token ~= W.travelToken then return false end
 		r = hrp()
 		dist = (Vector3.new(target.X, 0, target.Z) - Vector3.new(r.Position.X, 0, r.Position.Z)).Magnitude
@@ -1190,6 +1192,9 @@ function W.clearAI(rad, maxT)
 	while alive() and aiNear(hrp().Position, rad) > 0 and os.clock() - t0 < maxT do
 		local h = hum()
 		if h.Health / h.MaxHealth * 100 < cfg.fleeHp then return false end
+		-- a player showing up ends it right away: the farm loop flees while we still have the HP
+		-- for Apparate (died here: rogue burst 125 -> 31 in 3s while we waited on spiders)
+		if os.clock() < W.dangerUntil or #W.realThreats() > 0 then return false end
 		status("clearing spiders")
 		task.wait(0.3)
 	end
@@ -1252,8 +1257,12 @@ function W.mineTarget(coalToo, rockBonus)
 			if p.Magnitude > 5 and (gem or d < 500 or rockBonus) and #W.threats(cfg.workClear, p) == 0 then
 				local rate
 				if gem and not inCave then
-					-- measured: ~10s to land in the ravine + walk, ~10s per gem (walk, spiders, ~5s mining)
-					rate = gemsUp * GEM_VALUE / (d / 100 + 20 + gemsUp * 10)
+					-- measured per visit: ~30s in (descent + walk + spiders), ~12s per gem, and out ~25s
+					-- on foot vs ~5s with Royal Apparate (12s cd). Without the Baron a visit made ~20k/h
+					-- (260 of 600s in transit), with it 130k/h.
+					local sp = apparateSpell()
+					local out = (sp and sp.Name == "Royal Apparate") and 5 or 25
+					rate = gemsUp * GEM_VALUE / (d / 100 + 30 + out + gemsUp * 12)
 				else
 					rate = ((gem and GEM_VALUE or COAL_VALUE) + (rockBonus or 0)) / (d / 100 + 8)
 				end
@@ -1273,6 +1282,11 @@ function W.mineVein(v)
 	local stand = W.veinStand(v, vp)
 	if gem then
 		if not W.inCave() and (hrp().Position - W.CAVE_ENTRY).Magnitude > 12 then
+			-- the cave is a dead end: walking out under fire killed us. Go in only with Apparate
+			-- ready (or about to be) or nobody dangerous anywhere near
+			local sp = apparateSpell()
+			local cdLeft = sp and (sp:GetAttribute("CooldownExpire") or 0) - workspace:GetServerTimeNow() or 999
+			if cdLeft > 5 and #W.threats(1500, W.CAVE) > 0 then W.mineSkip[v] = os.clock() + 20 return false end
 			status("into the cave")
 			-- straight down from high above: a slanted landing crosses webs/rock and gets yanked back up
 			W.travel(W.CAVE_ENTRY + Vector3.new(0, 110, 0), 0, true)
@@ -1335,7 +1349,7 @@ function W.mineVein(v)
 				W.mineSkip[v] = os.clock() + 30
 				break
 			end
-			if #W.realThreats() > 0 then break end
+			if #W.realThreats() > 0 or os.clock() < W.dangerUntil then break end
 			if aiNear(hrp().Position, 25) > 0 then
 				W.swinging = false
 				if not W.clearAI(45, 20) then break end
@@ -2073,7 +2087,9 @@ function W.flee(reason)
 	local moved = false
 	-- Apparate is the fastest way out (gone in ~1.5s); the cloak (~0.5s cast) comes after it,
 	-- or first when we have to blink/fly away in sight of them
-	if cfg.useApparate and sp and h.Health > (sp:GetAttribute("HealthCost") or 50) + 15 and workspace:GetServerTimeNow() >= (sp:GetAttribute("CooldownExpire") or 0) then
+	-- in the cave, walking out is the death trap: Apparate even with little HP to spare
+	local margin = W.inCave and W.inCave() and 3 or 15
+	if cfg.useApparate and sp and h.Health > (sp:GetAttribute("HealthCost") or 50) + margin and workspace:GetServerTimeNow() >= (sp:GetAttribute("CooldownExpire") or 0) then
 		moved = W.apparate(dest or W.safeSpot(900, 3500), true)
 		if moved then W.stats.relocations = (W.stats.relocations or 0) + 1 end
 	end
