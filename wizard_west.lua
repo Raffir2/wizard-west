@@ -422,8 +422,10 @@ function W.fly(goal, speed, token, opts)
 	local r = hrp()
 	if not r then return false end
 	token = token or W.travelToken
-	local look = opts.look or 160
-	local vUp, vDown = opts.vUp or 45, opts.vDown or 30
+	-- 160 studs of lookahead at 120/s left ~1.3s to climb: we clipped hills and the server's
+	-- anti-noclip pulled us back up (most of 29 rollbacks / 50 min were upward pulls while climbing)
+	local look = opts.look or 260
+	local vUp, vDown = opts.vUp or 60, opts.vDown or 30
 	local clear = opts.clear or cfg.flyHeight
 	W.travelling = true
 	W.flySpeed = nil
@@ -521,7 +523,7 @@ function W.fly(goal, speed, token, opts)
 		local finalApproach = opts.descend ~= false and remain < math.max(60, (cur.Y - goal.Y) * 1.6)
 		if finalApproach then want = goal.Y end
 		local dy = want - cur.Y
-		local vmax = (dy > 0 and vUp or ((finalApproach or not jet) and 60 or vDown)) * dt
+		local vmax = (dy > 0 and vUp or (finalApproach and 60 or (not jet and 35) or vDown)) * dt
 		local ny = cur.Y + math.clamp(dy, -vmax, vmax)
 		W.lastVy = dt > 0 and (ny - cur.Y) / dt or 0
 		cur = Vector3.new(nx, ny, nz)
@@ -1987,8 +1989,14 @@ function W.grabNoble(p)
 	if not p.Parent then return false end
 	-- never "hover" onto a spot we didn't reach: that's a straight teleport the server snaps back
 	local r = hrp()
-	if not arrived or not r or (r.Position - pos).Magnitude > 20 then status("noble artifact: couldn't reach it") return false end
-	if #W.realThreats() > 0 then status("noble artifact: company, leaving") return false end
+	local function fail(why)
+		status("noble artifact: " .. why)
+		logf("ww_noble.txt", string.format("[%s] %s grab failed: %s | %s\n", os.date("%H:%M:%S"), m.Name, why, tostring(W.log[#W.log])))
+		return false
+	end
+	if not arrived or not r then return fail("couldn't reach it (arrived=" .. tostring(arrived) .. ")") end
+	if (r.Position - pos).Magnitude > 20 then return fail(string.format("ended %.0f studs away", (r.Position - pos).Magnitude)) end
+	if #W.realThreats() > 0 then return fail("company: " .. W.realThreats()[1].pl.Name) end
 	local before = {}
 	for _, t in ipairs(lp.Backpack:GetChildren()) do before[t] = true end
 	W.hoverPos = pos + Vector3.new(0, 1.5, 0)
